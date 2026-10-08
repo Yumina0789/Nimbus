@@ -50,7 +50,14 @@ UNIT_NAME="vlmcsd"
 INI_PATH="/etc/vlmcsd.ini"
 ACTION="install"
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# "curl | bash" leaves BASH_SOURCE[0] unset and "set -u" would abort on it, so the
+# script directory is optional: when it cannot be determined, every project file is
+# downloaded from RAW_BASE below instead of being copied from next to this script.
+SCRIPT_DIR=""
+if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+fi
+RAW_BASE="${NIMBUS_RAW_BASE:-https://raw.githubusercontent.com/Yumina0789/Nimbus/main}"
 
 step() { printf '\n==> %s\n' "$*"; }
 log()  { printf '    %s\n' "$*"; }
@@ -272,18 +279,30 @@ EOF
 # ---------------------------------------------------------------------------
 # Install
 # ---------------------------------------------------------------------------
-install_panel() {
-  if [ ! -f "$SCRIPT_DIR/nimbus.py" ]; then
-    die "nimbus.py not found next to install.sh"
+# Fetch one project file: prefer the copy next to this script (git clone), otherwise
+# download it, so that "curl | bash" installs work without a checkout.
+obtain() {
+  local name="$1" dest="$2"
+  if [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/$name" ]; then
+    cp "$SCRIPT_DIR/$name" "$dest"
+    return 0
   fi
-  if [ ! -f "$SCRIPT_DIR/ui.html" ]; then
-    die "ui.html not found next to install.sh"
+  log "downloading $name from $RAW_BASE"
+  if ! curl -fsSL --retry 3 --connect-timeout 15 "$RAW_BASE/$name" -o "$dest"; then
+    die "could not download $name from $RAW_BASE (set NIMBUS_RAW_BASE to use a mirror)"
   fi
+}
 
+install_panel() {
   step "Installing panel files into $PANEL_DIR"
   install -d -m 0755 "$PANEL_DIR"
-  install -m 0644 "$SCRIPT_DIR/nimbus.py" "$PANEL_DIR/nimbus.py"
-  install -m 0644 "$SCRIPT_DIR/ui.html" "$PANEL_DIR/ui.html"
+  local stage
+  stage="$(mktemp -d)"
+  obtain nimbus.py "$stage/nimbus.py"
+  obtain ui.html "$stage/ui.html"
+  install -m 0644 "$stage/nimbus.py" "$PANEL_DIR/nimbus.py"
+  install -m 0644 "$stage/ui.html" "$PANEL_DIR/ui.html"
+  rm -rf "$stage"
   log "nimbus.py + ui.html installed"
 
   step "Preparing data directory $DATA_DIR"
