@@ -47,8 +47,27 @@ BIND="127.0.0.1"
 KMS_PORT=1688
 WITH_VLMCSD=1
 UNIT_NAME="vlmcsd"
-INI_PATH="/etc/vlmcsd.ini"
+INI_PATH=""      # empty = detect at install time (see detect_ini)
 ACTION="install"
+
+# The vlmcsd project used to install its config to /etc/vlmcsd.ini and newer
+# releases use /etc/vlmcsd/vlmcsd.ini. Rather than making the operator guess,
+# probe the usual locations (and whatever the unit passes with -i) when --ini
+# was not given explicitly.
+detect_ini() {
+  local unit_ini
+  unit_ini="$(systemctl show "$UNIT_NAME" -p ExecStart --value 2>/dev/null \
+    | tr ' ' '\n' | grep -A1 '^-i$' | tail -1 || true)"
+  local candidate
+  for candidate in "$unit_ini" /etc/vlmcsd.ini /etc/vlmcsd/vlmcsd.ini \
+                   /usr/local/etc/vlmcsd.ini /etc/vlmcsd.conf; do
+    if [ -n "$candidate" ] && [ -f "$candidate" ]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  printf '/etc/vlmcsd.ini\n'
+}
 
 # "curl | bash" leaves BASH_SOURCE[0] unset and "set -u" would abort on it, so the
 # script directory is optional: when it cannot be determined, every project file is
@@ -74,7 +93,7 @@ Panel options
   --port N          panel TCP port                       (default: 8099)
   --bind ADDR       panel bind address                    (default: 127.0.0.1)
   --unit NAME       systemd unit Nimbus manages           (default: vlmcsd)
-  --ini PATH        vlmcsd config file Nimbus edits       (default: /etc/vlmcsd.ini)
+  --ini PATH        vlmcsd config file Nimbus edits       (default: auto-detected)
 
 KMS (vlmcsd) options
   --with-vlmcsd     install vlmcsd too when it is missing (default: ON)
@@ -155,6 +174,14 @@ fi
 if [ "$(id -u)" -ne 0 ]; then
   die "please run as root: sudo bash install.sh"
 fi
+
+# Resolve the vlmcsd ini before the systemd unit is written: a ReadWritePaths
+# entry that does not exist makes systemd fail to set up the mount namespace and
+# the service dies with status=226/NAMESPACE (hit on a clean Ubuntu 20.04 box).
+if [ -z "$INI_PATH" ]; then
+  INI_PATH="$(detect_ini)"
+fi
+log "vlmcsd config file: $INI_PATH"
 
 # ---------------------------------------------------------------------------
 # Environment checks
@@ -260,7 +287,6 @@ ProtectKernelLogs=yes
 ProtectControlGroups=yes
 ProtectClock=yes
 ProtectHostname=yes
-ProtectProc=invisible
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 RestrictNamespaces=yes
 LockPersonality=yes
@@ -269,7 +295,13 @@ SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
 CapabilityBoundingSet=
 AmbientCapabilities=
-ReadWritePaths=${INI_PATH} ${INI_PATH}.bak ${INI_PATH}.tmp
+# The panel rewrites the vlmcsd ini in place and keeps .bak/.tmp copies next to
+# it, so the whole directory has to stay writable. ReadWritePaths also has to
+# point at something that EXISTS: systemd fails to set up the mount namespace
+# (status=226/NAMESPACE) when the path is missing, which is why the directory is
+# used instead of the file. ProtectSystem=strict still keeps everything else
+# read-only.
+ReadWritePaths=/etc
 
 [Install]
 WantedBy=multi-user.target
