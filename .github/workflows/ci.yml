@@ -70,6 +70,64 @@ jobs:
           echo "bad login status: $code"
           test "$code" = "403"
 
+          echo "--- 账户：首次设置 → 登录 → 账户管理 ---"
+          curl -fsS "http://127.0.0.1:8099/api/auth" -o "$RUNNER_TEMP/auth.json"
+          python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); assert d["need_setup"] is True, d; assert d["password_min"] >= 8, d; print("need_setup ok")' "$RUNNER_TEMP/auth.json"
+
+          echo "短密码要被拒"
+          code="$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' -d '{"name":"ci","password":"short"}' "http://127.0.0.1:8099/api/setup")"
+          test "$code" = "400"
+
+          echo "首次设置账户"
+          curl -fsS -X POST -H 'Content-Type: application/json' -d '{"name":"ci","password":"ci-password"}' "http://127.0.0.1:8099/api/setup" -o "$RUNNER_TEMP/setup.json"
+          SESSION="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); assert d["ok"] and d["session"], d; print(d["session"])' "$RUNNER_TEMP/setup.json")"
+          echo "拿到会话令牌"
+
+          echo "有账户之后再调 setup 必须 403"
+          code="$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' -d '{"name":"x","password":"xxxxxxxx"}' "http://127.0.0.1:8099/api/setup")"
+          test "$code" = "403"
+
+          echo "用会话令牌访问受保护接口"
+          curl -fsS -H "Authorization: Bearer $SESSION" "http://127.0.0.1:8099/api/accounts" -o "$RUNNER_TEMP/accounts.json"
+          python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); assert [u["name"] for u in d["users"]] == ["ci"], d; assert d["me"] == "ci", d; print("accounts ok:", d["users"])' "$RUNNER_TEMP/accounts.json"
+
+          echo "新增账户"
+          curl -fsS -X POST -H "Authorization: Bearer $SESSION" -H 'Content-Type: application/json' -d '{"name":"ci2","password":"ci2-password"}' "http://127.0.0.1:8099/api/accounts/create" -o "$RUNNER_TEMP/create.json"
+          python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); assert d["ok"] and len(d["users"]) == 2, d; print("create ok")' "$RUNNER_TEMP/create.json"
+
+          echo "新账户能登录"
+          curl -fsS -X POST -H 'Content-Type: application/json' -d '{"name":"ci2","password":"ci2-password"}' "http://127.0.0.1:8099/api/login" -o "$RUNNER_TEMP/login2.json"
+          S2="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1],encoding="utf-8"))["session"])' "$RUNNER_TEMP/login2.json")"
+
+          echo "改密码后旧会话必须失效"
+          curl -fsS -X POST -H "Authorization: Bearer $SESSION" -H 'Content-Type: application/json' -d '{"name":"ci2","password":"ci2-password2","actor_password":"ci-password"}' "http://127.0.0.1:8099/api/accounts/password" -o "$RUNNER_TEMP/pw.json"
+          code="$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $S2" "http://127.0.0.1:8099/api/accounts")"
+          echo "旧会话状态: $code"; test "$code" = "401"
+
+          echo "错密码 403 / 当前密码不对改不了"
+          code="$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' -d '{"name":"ci","password":"wrong"}' "http://127.0.0.1:8099/api/login")"
+          test "$code" = "403"
+          code="$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "Authorization: Bearer $SESSION" -H 'Content-Type: application/json' -d '{"name":"ci2","password":"whatever1","actor_password":"wrong"}' "http://127.0.0.1:8099/api/accounts/password")"
+          test "$code" = "403"
+
+          echo "删除账户；最后一个删不掉"
+          curl -fsS -X POST -H "Authorization: Bearer $SESSION" -H 'Content-Type: application/json' -d '{"name":"ci2"}' "http://127.0.0.1:8099/api/accounts/delete" >/dev/null
+          code="$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "Authorization: Bearer $SESSION" -H 'Content-Type: application/json' -d '{"name":"ci"}' "http://127.0.0.1:8099/api/accounts/delete")"
+          test "$code" = "400"
+
+          echo "账户事件进了统计库的 auth 表"
+          curl -fsS -H "Authorization: Bearer $SESSION" "http://127.0.0.1:8099/api/accounts" -o "$RUNNER_TEMP/accounts2.json"
+          python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); assert d["log"], d; print("auth log ok:", len(d["log"]), "条")' "$RUNNER_TEMP/accounts2.json"
+
+          echo "服务 token 仍然可用于机器调用（Steward 靠它拉限流决策）"
+          curl -fsS -H "Authorization: Bearer testtoken" "http://127.0.0.1:8099/api/enforce/pending" -o "$RUNNER_TEMP/pending.json"
+          python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); assert "ban" in d and "unban" in d, d; print("service token ok")' "$RUNNER_TEMP/pending.json"
+
+          echo "退出登录后旧会话失效"
+          curl -fsS -X POST -H "Authorization: Bearer $SESSION" "http://127.0.0.1:8099/api/logout" >/dev/null
+          code="$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $SESSION" "http://127.0.0.1:8099/api/accounts")"
+          echo "退出后: $code"; test "$code" = "401"
+
           kill "$pid"
           wait "$pid" 2>/dev/null || true
           echo "demo smoke test passed"

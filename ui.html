@@ -260,6 +260,7 @@
   <symbol id="i-check-circle" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M8.5 12.5l2.5 2.5 4.5-5"/></symbol>
   <symbol id="i-x-circle" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M9 9l6 6M15 9l-6 6"/></symbol>
   <symbol id="i-users" viewBox="0 0 24 24"><circle cx="9" cy="8" r="3.2"/><path d="M3.5 20c.6-3.2 2.9-5 5.5-5s4.9 1.8 5.5 5"/><path d="M16 8.2a3 3 0 0 1 0 5.6M17 20c-.2-1.6-.6-2.9-1.3-3.9"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M4 12a8 8 0 0 1 13.7-5.6L20 8"/><path d="M20 4v4h-4"/><path d="M20 12a8 8 0 0 1-13.7 5.6L4 16"/><path d="M4 20v-4h4"/></symbol>
   <symbol id="i-database" viewBox="0 0 24 24"><ellipse cx="12" cy="6" rx="7.5" ry="3"/><path d="M4.5 6v12c0 1.7 3.4 3 7.5 3s7.5-1.3 7.5-3V6M4.5 12c0 1.7 3.4 3 7.5 3s7.5-1.3 7.5-3"/></symbol>
   <symbol id="i-percent" viewBox="0 0 24 24"><path d="M19 5 5 19"/><circle cx="7.5" cy="7.5" r="2.5"/><circle cx="16.5" cy="16.5" r="2.5"/></symbol>
   <symbol id="i-save" viewBox="0 0 24 24"><path d="M5 3h10l4 4v14H5z"/><path d="M9 3v6h6V3M8 17h8"/></symbol>
@@ -286,17 +287,38 @@
 <!-- 登录 -->
 <div id="login" class="hidden">
   <div class="box glass panel">
-    <h2><svg class="ico"><use href="#i-shield"/></svg>Nimbus 管理面板</h2>
-    <div class="field">
-      <label>访问 token</label>
-      <input id="loginToken" type="password" placeholder="启动时终端输出的一串 token">
-      <div class="hint">在服务器上取：<code class="mono">docker exec kms cat /var/lib/nimbus/nimbus.token</code><br>
-        非容器安装就是 <code class="mono">cat /var/lib/nimbus/nimbus.token</code>。<br>
-        更省事的办法：用带 token 的地址打开，例如
-        <code class="mono">https://你的域名/?token=这串token</code>，登录状态会记在这个浏览器里。</div>
+    <h2><svg class="ico"><use href="#i-shield"/></svg><span id="lgTitle">Nimbus 管理面板</span></h2>
+
+    <div id="setupBox" class="hidden">
+      <div class="hint" style="margin-bottom:10px">
+        这台面板还没有账户。先设一个：以后用<b>用户名 + 密码</b>登录，不再需要那串 token。
+      </div>
+      <label style="font-size:12px;color:var(--dim)">用户名</label>
+      <input id="suName" type="text" style="width:100%;margin:6px 0" placeholder="例如 admin"
+             autocomplete="username">
+      <label style="font-size:12px;color:var(--dim)">密码（至少 <span id="pwMin">8</span> 位）</label>
+      <input id="suPass" type="password" style="width:100%;margin:6px 0" autocomplete="new-password">
+      <label style="font-size:12px;color:var(--dim)">再输一遍</label>
+      <input id="suPass2" type="password" style="width:100%;margin:6px 0" autocomplete="new-password">
+      <button class="act" style="width:100%;margin-top:8px" onclick="doSetup()">
+        <svg class="ico"><use href="#i-check"/></svg>创建账户并进入</button>
     </div>
-    <button class="act" style="width:100%" onclick="doLogin()">
-      <svg class="ico"><use href="#i-check"/></svg>登录</button>
+
+    <div id="loginBox" class="hidden">
+      <label style="font-size:12px;color:var(--dim)">用户名</label>
+      <input id="loginName" type="text" style="width:100%;margin:6px 0" autocomplete="username">
+      <label style="font-size:12px;color:var(--dim)">密码</label>
+      <input id="loginPass" type="password" style="width:100%;margin:6px 0" autocomplete="current-password"
+             onkeydown="if(event.key==='Enter') doLogin()">
+      <button class="act" style="width:100%;margin-top:8px" onclick="doLogin()">
+        <svg class="ico"><use href="#i-check"/></svg>登录</button>
+      <div class="hint" style="margin-top:10px">
+        脚本/其它程序调用仍然可以用服务 token：
+        <code class="mono">cat /var/lib/nimbus/nimbus.token</code>（容器里
+        <code class="mono">docker exec kms cat /var/lib/nimbus/nimbus.token</code>）
+      </div>
+    </div>
+
     <div id="loginErr" class="hint bad-v" style="margin-top:8px"></div>
   </div>
 </div>
@@ -321,6 +343,7 @@
       <button data-tab="domain"><svg class="ico"><use href="#i-globe"/></svg>域名与 HTTPS</button>
       <button data-tab="limits"><svg class="ico"><use href="#i-ban"/></svg>限流</button>
       <button data-tab="stats"><svg class="ico"><use href="#i-chart"/></svg>激活统计</button>
+      <button data-tab="accounts"><svg class="ico"><use href="#i-users"/></svg>账户</button>
     </div>
   </nav>
 </header>
@@ -573,13 +596,68 @@
       </details>
     </div>
   </section>
+  <!-- 账户 -->
+  <section id="tab-accounts" class="hidden">
+    <div class="grid g2">
+      <div class="panel glass" style="margin:0">
+        <h2><svg class="ico"><use href="#i-users"/></svg>账户
+          <span class="q">所有账户权限相同（都是管理员）</span>
+          <span class="end" id="acMe"></span></h2>
+        <div class="scroll" style="max-height:280px"><table>
+          <thead><tr><th>用户名</th><th>创建于</th><th>上次登录</th><th class="num">会话</th>
+            <th class="num">操作</th></tr></thead>
+          <tbody id="acBody"></tbody></table></div>
+        <h2 style="margin-top:14px"><svg class="ico"><use href="#i-users"/></svg>新增账户</h2>
+        <div class="row">
+          <input id="acNew" type="text" placeholder="用户名" style="width:170px">
+          <input id="acNewPass" type="password" placeholder="密码（至少 8 位）" style="width:210px">
+          <button class="act" onclick="createAccount()">
+            <svg class="ico"><use href="#i-check"/></svg>创建</button>
+        </div>
+      </div>
+      <div class="panel glass" style="margin:0">
+        <h2><svg class="ico"><use href="#i-shield"/></svg>修改密码
+          <span class="q">改谁的都行，但要用你自己当前的密码确认一次</span></h2>
+        <div class="field"><label>要改哪个账户</label>
+          <input id="pwTarget" type="text" style="width:100%" placeholder="用户名（留空 = 改自己）"></div>
+        <div class="field" style="margin-top:8px"><label>新密码（至少 8 位）</label>
+          <input id="pwNew" type="password" style="width:100%"></div>
+        <div class="field" style="margin-top:8px"><label>你自己当前的密码</label>
+          <input id="pwActor" type="password" style="width:100%"></div>
+        <div class="row" style="margin-top:10px">
+          <button class="act" onclick="changePassword()">
+            <svg class="ico"><use href="#i-check"/></svg>保存新密码</button>
+          <span class="hint">改完那个账户的登录态会全部失效</span>
+        </div>
+        <h2 style="margin-top:16px"><svg class="ico"><use href="#i-logout"/></svg>会话</h2>
+        <div class="row">
+          <button class="act ghost" onclick="logoutAll()">
+            <svg class="ico"><use href="#i-logout"/></svg>退出我的所有会话</button>
+          <button class="act ghost" onclick="loadAccounts()">
+            <svg class="ico"><use href="#i-refresh"/></svg>刷新</button>
+        </div>
+        <div class="hint" style="margin-top:10px">
+          脚本/Steward 这类机器调用用服务 token（<code class="mono">/var/lib/nimbus/nimbus.token</code>），
+          它不随账户变动失效。
+        </div>
+      </div>
+    </div>
+    <div class="panel glass">
+      <h2><svg class="ico"><use href="#i-file"/></svg>账户事件
+        <span class="q">登录、失败、增删改都在这里</span></h2>
+      <div class="scroll" style="max-height:300px"><table>
+        <thead><tr><th>时间</th><th>账户</th><th>来源</th><th>动作</th><th>结果</th><th>说明</th></tr></thead>
+        <tbody id="acLog"></tbody></table></div>
+    </div>
+  </section>
 </main>
 
 <div class="toast glass" id="toast"><svg class="ico"><use href="#i-check-circle"/></svg><span id="toastMsg"></span></div>
 
 <script>
-const TOKEN_KEY = "nimbus_token", THEME_KEY = "nimbus_theme";
-let TOKEN = new URLSearchParams(location.search).get("token") || localStorage.getItem(TOKEN_KEY) || "";
+const CRED_KEY = "nimbus_session", THEME_KEY = "nimbus_theme";
+let TOKEN = new URLSearchParams(location.search).get("token") || localStorage.getItem(CRED_KEY) || "";
+let ME = "", AUTH = {};
 let SCHEMA = [], LOADED = {}, stPage = 1, stTimer = null, lastRunning = null, dirty = false;
 
 /* --- 主题 ------------------------------------------------------------- */
@@ -627,18 +705,124 @@ async function api(path, opts={}){
   return r.json();
 }
 
-/* --- 登录 ------------------------------------------------------------- */
-function showLogin(){ document.getElementById("login").classList.remove("hidden"); }
-function logout(){ localStorage.removeItem(TOKEN_KEY); TOKEN = ""; showLogin(); }
+/* --- 登录 / 首次设置 -------------------------------------------------- */
+function showLogin(needSetup){
+  document.getElementById("login").classList.remove("hidden");
+  document.getElementById("setupBox").classList.toggle("hidden", !needSetup);
+  document.getElementById("loginBox").classList.toggle("hidden", !!needSetup);
+  document.getElementById("lgTitle").textContent = needSetup ? "第一次使用：设置账户" : "Nimbus 管理面板";
+  document.getElementById("loginErr").textContent = "";
+  setTimeout(() => {
+    const el = document.getElementById(needSetup ? "suName" : "loginName");
+    if(el) el.focus();
+  }, 50);
+}
+function logout(){
+  if(TOKEN) api("/api/logout", {method:"POST"}).catch(() => {});
+  localStorage.removeItem(CRED_KEY);
+  TOKEN = ""; ME = "";
+  showLogin(false);
+}
+function _loginErr(msg){ document.getElementById("loginErr").innerHTML = esc(msg); }
+async function _post(path, body){
+  const r = await fetch(path, {method:"POST", headers:{"Content-Type":"application/json"},
+                               body: JSON.stringify(body || {})});
+  let j = {};
+  try{ j = await r.json(); }catch(e){}
+  return {status: r.status, j};
+}
+function _entered(res){
+  TOKEN = res.session; ME = res.name;
+  localStorage.setItem(CRED_KEY, TOKEN);
+  document.getElementById("login").classList.add("hidden");
+  boot();
+}
 async function doLogin(){
-  const t = document.getElementById("loginToken").value.trim();
-  const r = await fetch("/api/login", {method:"POST", headers:{"Content-Type":"application/json"},
-                                       body: JSON.stringify({token:t})});
-  const j = await r.json();
+  const n = document.getElementById("loginName").value.trim();
+  const p = document.getElementById("loginPass").value;
+  if(!n || !p){ _loginErr("请填用户名和密码"); return; }
+  const {j} = await _post("/api/login", {name: n, password: p});
+  if(j.ok) _entered(j);
+  else _loginErr(j.error || "登录失败");
+}
+async function doSetup(){
+  const n = document.getElementById("suName").value.trim();
+  const p1 = document.getElementById("suPass").value;
+  const p2 = document.getElementById("suPass2").value;
+  const min = AUTH.password_min || 8;
+  if(!n){ _loginErr("请填用户名"); return; }
+  if((p1 || "").length < min){ _loginErr("密码至少 " + min + " 位"); return; }
+  if(p1 !== p2){ _loginErr("两次输入的密码不一样"); return; }
+  const {j} = await _post("/api/setup", {name: n, password: p1});
+  if(j.ok) _entered(j);
+  else _loginErr(j.error || "创建失败");
+}
+
+/* --- 账户 ------------------------------------------------------------- */
+const fmtTime = ts => ts ? new Date(ts * 1000).toLocaleString("zh-CN") : "–";
+const AUTH_LABEL = {setup: "首次设置", login: "登录", logout_all: "退出全部会话"};
+async function loadAccounts(){
+  const j = await api("/api/accounts");
+  document.getElementById("acMe").textContent = "当前登录：" + (j.me || "?");
+  document.getElementById("acBody").innerHTML = (j.users || []).map(u =>
+    `<tr><td class="mono">${esc(u.name)}${u.name === j.me ? ' <span class="tag info">自己</span>' : ""}</td>
+      <td class="hint">${esc(fmtTime(u.created))}</td>
+      <td class="hint">${esc(fmtTime(u.last_login))}</td>
+      <td class="num">${num(u.sessions)}</td>
+      <td class="num">
+        <button class="act ghost mini" onclick="useTarget('${esc(u.name)}')">改密码</button>
+        <button class="act danger mini" onclick="deleteAccount('${esc(u.name)}')">删除</button>
+      </td></tr>`).join("") || '<tr><td colspan="5" class="empty">没有账户</td></tr>';
+  document.getElementById("acLog").innerHTML = (j.log || []).map(e =>
+    `<tr><td class="mono hint">${esc(new Date(e.ts * 1000).toLocaleString("zh-CN"))}</td>
+      <td class="mono">${esc(e.name)}</td><td class="mono hint">${esc(e.ip)}</td>
+      <td>${esc(AUTH_LABEL[e.action] || e.action)}</td>
+      <td>${e.ok ? '<span class="tag ok">成功</span>' : '<span class="tag bad">失败</span>'}</td>
+      <td class="hint">${esc(e.detail || "")}</td></tr>`).join("") ||
+    '<tr><td colspan="6" class="empty">还没有记录</td></tr>';
+}
+function useTarget(name){
+  document.getElementById("pwTarget").value = name;
+  document.getElementById("pwNew").focus();
+}
+async function createAccount(){
+  const name = document.getElementById("acNew").value.trim();
+  const password = document.getElementById("acNewPass").value;
+  if(!name || !password) return toast("用户名和密码都要填", true);
+  const j = await api("/api/accounts/create", {method:"POST", body: JSON.stringify({name, password})});
   if(j.ok){
-    TOKEN = j.token; localStorage.setItem(TOKEN_KEY, TOKEN);
-    document.getElementById("login").classList.add("hidden"); boot();
-  } else document.getElementById("loginErr").textContent = j.error || "登录失败";
+    toast("已创建账户 " + esc(name));
+    document.getElementById("acNew").value = "";
+    document.getElementById("acNewPass").value = "";
+    loadAccounts();
+  } else toast(esc(j.error || "创建失败"), true);
+}
+async function changePassword(){
+  const name = document.getElementById("pwTarget").value.trim();
+  const password = document.getElementById("pwNew").value;
+  const actor_password = document.getElementById("pwActor").value;
+  if(!password) return toast("请填新密码", true);
+  if(!actor_password) return toast("请输入你自己当前的密码", true);
+  const j = await api("/api/accounts/password", {method:"POST",
+                                                 body: JSON.stringify({name, password, actor_password})});
+  if(j.ok){
+    toast("密码已更新" + ((name || ME) === ME ? "，请重新登录" : "：" + esc(name)));
+    document.getElementById("pwNew").value = "";
+    document.getElementById("pwActor").value = "";
+    if((name || ME) === ME) logout(); else loadAccounts();
+  } else toast(esc(j.error || "修改失败"), true);
+}
+async function deleteAccount(name){
+  if(!confirm("删除账户 " + name + " ？\n\n它的登录态会立刻失效。最后一个账户不能删。")) return;
+  const j = await api("/api/accounts/delete", {method:"POST", body: JSON.stringify({name})});
+  if(j.ok){ toast("已删除 " + esc(name)); if(name === ME) logout(); else loadAccounts(); }
+  else toast(esc(j.error || "删除失败"), true);
+}
+async function logoutAll(){
+  if(!confirm("退出你自己的所有会话？（包括这个浏览器）")) return;
+  const j = await api("/api/accounts/logout-all", {method:"POST"});
+  toast("已退出 " + num(j.dropped) + " 个会话");
+  logout();
 }
 
 /* --- 启动 ------------------------------------------------------------- */
@@ -1092,17 +1276,27 @@ function setStatsAuto(on){
 }
 document.querySelectorAll("nav button").forEach(b => b.onclick = () => {
   document.querySelectorAll("nav button").forEach(x => x.classList.toggle("active", x === b));
-  for(const id of ["overview","config","service","domain","limits","stats"])
+  for(const id of ["overview","config","service","domain","limits","stats","accounts"])
     document.getElementById("tab-" + id).classList.toggle("hidden", id !== b.dataset.tab);
   if(b.dataset.tab === "stats"){ loadStats(stPage); setStatsAuto(true); }
   else setStatsAuto(false);
   if(b.dataset.tab === "domain") loadDomain();
   if(b.dataset.tab === "limits") loadLimits();
+  if(b.dataset.tab === "accounts") loadAccounts();
 });
 
 /* --- 入口 ------------------------------------------------------------- */
 applyTheme(localStorage.getItem(THEME_KEY) || "light");
-if(TOKEN) boot(); else showLogin();
+(async () => {
+  try{
+    AUTH = await fetch("/api/auth").then(r => r.json());
+  }catch(e){ AUTH = {}; }
+  ME = AUTH.me || "";
+  const minEl = document.getElementById("pwMin");
+  if(minEl) minEl.textContent = AUTH.password_min || 8;
+  if(AUTH.need_setup){ showLogin(true); return; }      // 第一次进来：先设账户
+  if(TOKEN) boot(); else showLogin(false);
+})();
 </script>
 </body>
 </html>
