@@ -41,7 +41,12 @@ RUN mkdir -p /etc/supervisor/conf.d /run \
 ARG RELEASE_TAG=binaries
 ARG RELEASE_BASE=https://github.com/Yumina0789/V1mc4d/releases/download
 ARG ARCH=x86_64
+# 这一层会被 Docker 缓存：release 换了新二进制、但这层内容没变时，普通 rebuild
+# 会继续用旧的 vlmcsd。要拿新版本就传一个变过的值：
+#   VLMCSD_CACHEBUST=$(date +%s) docker compose build
+ARG VLMCSD_CACHEBUST=0
 RUN set -eux; \
+    echo "vlmcsd cachebust=${VLMCSD_CACHEBUST}"; \
     for name in vlmcsd vlmcs; do \
       curl -fsSL --retry 3 --connect-timeout 15 -H 'Cache-Control: no-cache' \
         "${RELEASE_BASE}/${RELEASE_TAG}/${name}-linux-${ARCH}-static" \

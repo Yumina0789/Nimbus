@@ -13,6 +13,9 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+      # 想拉取最新的 vlmcsd/vlmcs 二进制时：VLMCSD_CACHEBUST=$(date +%s) docker compose build
+      args:
+        VLMCSD_CACHEBUST: "${VLMCSD_CACHEBUST:-0}"
     image: nimbus:local
     container_name: kms
     hostname: kms
