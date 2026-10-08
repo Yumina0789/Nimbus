@@ -330,6 +330,7 @@
         <h2><svg class="ico"><use href="#i-cpu"/></svg>运行信息</h2>
         <div class="kv">
           <div class="k">版本</div><div class="v" id="ovVersion">–</div>
+          <div class="k">构建</div><div class="v" style="font-size:12.5px" id="ovBuild">–</div>
           <div class="k">进程 PID</div><div class="v" id="ovPid">–</div>
           <div class="k">程序路径</div><div class="v mono" id="ovBin">–</div>
           <div class="k">程序 SHA-256</div><div class="v mono" style="font-size:12px" id="ovSha">–</div>
@@ -603,6 +604,7 @@ async function loadSummary(){
     document.getElementById("ovQuota").textContent = "配额 " + bytes(st.quota_bytes);
     document.getElementById("ovExec").textContent = j.execstart;
     document.getElementById("ovVersion").textContent = s.version || "–";
+    document.getElementById("ovBuild").textContent = s.build || "–";
     document.getElementById("ovPid").textContent = s.pid ?? "–";
     document.getElementById("ovBin").textContent = s.binary || "–";
     document.getElementById("ovSha").textContent = s.sha256 || "–";

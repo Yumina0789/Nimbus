@@ -368,6 +368,7 @@ class DemoBackend:
             "uptime": int(time.time() - self.started_at),
             "pid": 4242 if self.running else None,
             "version": "vlmcsd 1113 (demo)",
+            "build": "clang 15.0 · x86_64 Linux musl PIE (演示数据)",
             "binary": "/usr/local/bin/vlmcsd",
             "sha256": "3f9c1d0e7a5b46c2e8f1a9d3b7c5e2f4a6b8d0c2e4f6a8b0c2d4e6f8a0b2c4d6",
             "reload_pending": self.pending_reload,
@@ -477,6 +478,7 @@ class LinuxBackend:
         self.log_lines = []
         self.previous = None
         self._ini_extra = []
+        self._bin_cache = {}
         self._tail_thread = None
         self.available = self._detect_service()
         threading.Thread(target=self._tail, daemon=True).start()
@@ -502,6 +504,49 @@ class LinuxBackend:
     def _missing_hint(self) -> str:
         return (f"未检测到 KMS 服务：systemd 单元 {self.UNIT} 不存在（没装 vlmcsd，或单元名不对）。"
                 f"面板其余功能照常可用。")
+
+    # --- 被管理二进制：路径 / 版本 / 构建信息 / sha256 ---------------------
+    def _binary_info(self):
+        """问二进制自己的版本，别在面板里写死。
+
+        vlmcsd -V 会打印 "vlmcsd <git 描述> 64-bit" 加编译器与目标平台。面板每 5
+        秒轮询一次状态，所以按 (路径, mtime) 缓存，不用每次都开进程 + 读整份文件。
+        """
+        path = ""
+        for cand in (shutil.which("vlmcsd"), "/usr/local/bin/vlmcsd",
+                     "/usr/bin/vlmcsd", "/usr/sbin/vlmcsd"):
+            if cand and Path(cand).exists():
+                path = cand
+                break
+        if not path:
+            return {"path": "", "version": "", "build": "", "sha256": None}
+        try:
+            mtime = os.stat(path).st_mtime
+        except OSError:
+            mtime = 0
+        cached = self._bin_cache
+        if cached.get("path") == path and cached.get("mtime") == mtime:
+            return cached
+        version = build = ""
+        try:
+            r = subprocess.run([path, "-V"], capture_output=True, text=True, timeout=10)
+            lines = [l.strip() for l in ((r.stdout or "") + "\n" + (r.stderr or "")).splitlines()
+                     if l.strip()]
+            if lines:
+                version = lines[0]
+            parts = []
+            for line in lines:
+                if line.startswith("Compiler:"):
+                    parts.append(line.split(":", 1)[1].strip())
+                elif line.startswith("Intended platform:"):
+                    parts.append(line.split(":", 1)[1].strip())
+            build = " · ".join(parts)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        info = {"path": path, "version": version, "build": build,
+                "sha256": _sha256(Path(path)), "mtime": mtime}
+        self._bin_cache = info
+        return info
 
     # --- ini -------------------------------------------------------------
     def read_config(self):
@@ -579,7 +624,7 @@ class LinuxBackend:
                 "available": False, "unit": self.UNIT, "ini": str(self.INI),
                 "manager": self.manager,
                 "running": False, "pid": None, "since": None, "uptime": None,
-                "version": None, "binary": None, "sha256": None,
+                "version": None, "build": "", "binary": None, "sha256": None,
                 "reload_pending": False, "hint": self._missing_hint(),
             }
         r_active, _ = self._systemctl("is-active", self.UNIT, timeout=10)
@@ -589,15 +634,18 @@ class LinuxBackend:
         info = r_show.stdout if r_show else ""
         pid = re.search(r"MainPID=(\d+)", info)
         since = re.search(r"ActiveEnterTimestamp=(.+)", info)
+        binfo = self._binary_info()
         return {
             "available": True, "unit": self.UNIT, "ini": str(self.INI),
             "manager": self.manager,
             "running": active == "active",
             "pid": int(pid.group(1)) if pid and pid.group(1) != "0" else None,
             "since": since.group(1).strip() if since else None,
-            "uptime": None, "version": "vlmcsd (real)",
-            "binary": "/usr/local/bin/vlmcsd",
-            "sha256": _sha256(Path("/usr/local/bin/vlmcsd")),
+            "uptime": None,
+            "version": binfo["version"],          # 真的去问二进制，别写死
+            "build": binfo["build"],
+            "binary": binfo["path"],
+            "sha256": binfo["sha256"],
             "reload_pending": False,
         }
 
