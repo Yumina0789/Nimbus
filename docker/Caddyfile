@@ -36,3 +36,8 @@ adkms.lolicon.fans {
 		format console
 	}
 }
+
+# 别的服务的站点放单独文件里，见 caddy-sites/。这样 Nimbus 的「域名与 HTTPS」
+# 页看到的永远只有它自己那一个站点块，不会被"有多个站点块，我不替你猜"挡住。
+# 目录是只读挂进来的（compose 里 ./caddy-sites:/etc/caddy/sites:ro）。
+import /etc/caddy/sites/*.caddy

@@ -51,6 +51,7 @@ services:
       - "443:443/udp"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./caddy-sites:/etc/caddy/sites:ro   # 别的服务的站点文件，主 Caddyfile 用 import 收进来
       - caddy-data:/data            # 证书存在这里，别删
       - caddy-config:/config
     environment:
