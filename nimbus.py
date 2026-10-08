@@ -206,13 +206,32 @@ class StatsStore:
         )
         self.db.execute("CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts)")
         self.db.execute("CREATE INDEX IF NOT EXISTS idx_events_product ON events(product)")
+        # 机器码（CMID）是后加的列：老库要能平滑升上来，不能要求用户删库
+        cols = {r[1] for r in self.db.execute("PRAGMA table_info(events)")}
+        if "cmid" not in cols:
+            self.db.execute("ALTER TABLE events ADD COLUMN cmid TEXT NOT NULL DEFAULT ''")
+        self.db.execute("CREATE INDEX IF NOT EXISTS idx_events_cmid ON events(cmid)")
+        # 执法流水：谁在什么时候因为什么被封/解封，以及 Steward 那边的结果
+        self.db.execute(
+            """CREATE TABLE IF NOT EXISTS enforce (
+                   ts      INTEGER NOT NULL,
+                   ip      TEXT    NOT NULL,
+                   action  TEXT    NOT NULL,   -- ban / unban
+                   reason  TEXT    NOT NULL,
+                   detail  TEXT    NOT NULL DEFAULT '',
+                   ok      INTEGER NOT NULL,
+                   response TEXT   NOT NULL DEFAULT ''
+               )"""
+        )
+        self.db.execute("CREATE INDEX IF NOT EXISTS idx_enforce_ts ON enforce(ts)")
         self.db.commit()
 
-    def add(self, ts: int, ip, product, version, ok, reason="", elapsed=0.0):
+    def add(self, ts: int, ip, product, version, ok, reason="", elapsed=0.0, cmid=""):
         with self.lock:
             self.db.execute(
-                "INSERT INTO events (ts, ip, product, version, ok, reason, elapsed) VALUES (?,?,?,?,?,?,?)",
-                (ts, ip, product, version, 1 if ok else 0, reason, elapsed),
+                "INSERT INTO events (ts, ip, product, version, ok, reason, elapsed, cmid) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (ts, ip, product, version, 1 if ok else 0, reason, elapsed, cmid or ""),
             )
             self.db.commit()
 
@@ -256,6 +275,57 @@ class StatsStore:
             self.db.execute("PRAGMA incremental_vacuum")
             self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         return removed
+
+    # --- 限流：按 IP / 机器码统计窗口内的激活次数 --------------------------
+    def counts(self, since_ts, by="ip", limit=20):
+        col = "cmid" if by == "cmid" else "ip"
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT %s AS k, COUNT(*) AS n, SUM(ok) AS ok, MAX(ts) AS last FROM events "
+                "WHERE ts >= ? AND %s <> '' GROUP BY %s ORDER BY n DESC, last DESC LIMIT ?"
+                % (col, col, col), (since_ts, limit)).fetchall()
+        return [{"key": r["k"], "n": r["n"], "ok": r["ok"] or 0, "last": r["last"]} for r in rows]
+
+    def ips_of_cmid(self, cmid, since_ts):
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT ip, COUNT(*) AS n FROM events WHERE cmid = ? AND ts >= ? "
+                "GROUP BY ip ORDER BY n DESC", (cmid, since_ts)).fetchall()
+        return [{"ip": r["ip"], "n": r["n"]} for r in rows]
+
+    def total_since(self, since_ts):
+        with self.lock:
+            return self.db.execute("SELECT COUNT(*) FROM events WHERE ts >= ?",
+                                   (since_ts,)).fetchone()[0]
+
+    # --- 执法流水 ---------------------------------------------------------
+    def record_enforce(self, ip, action, reason, ok, detail="", response=""):
+        with self.lock:
+            self.db.execute(
+                "INSERT INTO enforce (ts, ip, action, reason, detail, ok, response) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (int(time.time()), ip, action, reason, detail[:200], 1 if ok else 0,
+                 (response or "")[:400]),
+            )
+            self.db.commit()
+
+    def enforce_state(self):
+        """每个 IP 当前的执法状态：取该 IP 最后一条记录。ban=在封，unban=已解封。"""
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT e.* FROM enforce e JOIN (SELECT ip, MAX(ts) mts FROM enforce GROUP BY ip) m "
+                "ON e.ip = m.ip AND e.ts = m.mts ORDER BY e.ts DESC").fetchall()
+        return [{"ts": r["ts"], "ip": r["ip"], "action": r["action"], "reason": r["reason"],
+                 "detail": r["detail"], "ok": bool(r["ok"]), "response": r["response"]}
+                for r in rows]
+
+    def enforce_log(self, limit=100):
+        with self.lock:
+            rows = self.db.execute("SELECT * FROM enforce ORDER BY ts DESC LIMIT ?",
+                                   (limit,)).fetchall()
+        return [{"ts": r["ts"], "ip": r["ip"], "action": r["action"], "reason": r["reason"],
+                 "detail": r["detail"], "ok": bool(r["ok"]), "response": r["response"]}
+                for r in rows]
 
     def summary(self):
         day_start = int(datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
@@ -744,6 +814,7 @@ class LinuxBackend:
     SKU_RE = re.compile(r"SKU ID[^:]*:\s*\S+\s*\((?P<sku>[^)]+)\)")
     KMSID_RE = re.compile(r"KMS ID[^:]*:\s*\S+\s*\((?P<kms>[^)]+)\)")
     PROTO_RE = re.compile(r"Protocol version\s*:\s*(?P<ver>[\d.]+)")
+    CMID_RE = re.compile(r"Client machine ID\s*:\s*(?P<cmid>[0-9a-fA-F][0-9a-fA-F-]{10,40})")
     SENT_RE = re.compile(r">>>\s*Sending response")
     REJECT_RE = re.compile(r"(reject|not licensed|error|fail)", re.I)
     # 只有 "accepted" + "closed"、中间没有任何请求体的连接，是端口探活（监控健康检查、
@@ -789,11 +860,13 @@ class LinuxBackend:
         product = _alias_product(product)
         pv = self.PROTO_RE.search(block)
         version = ("v%s" % pv.group("ver")) if pv else ""
+        cm = self.CMID_RE.search(block)
+        cmid = cm.group("cmid").lower() if cm else ""
         reason = ""
         if not ok:
             bad = [ln for ln in block.splitlines() if self.REJECT_RE.search(ln)]
             reason = (bad[0] if bad else block.strip().splitlines()[-1] if block.strip() else "")[:120]
-        return ip, product, version, ok, reason
+        return ip, cmid, product, version, ok, reason
 
     def _feed(self, line):
         """喂一行日志进来：accepted 开块，closed 收块入库。"""
@@ -809,8 +882,8 @@ class LinuxBackend:
             if self.CLOSE_RE.search(line):
                 ev = self._event_from_block("\n".join(self._block))
                 if ev:
-                    ip, product, version, ok, reason = ev
-                    self.store.add(int(time.time()), ip, product, version, ok, reason)
+                    ip, cmid, product, version, ok, reason = ev
+                    self.store.add(int(time.time()), ip, product, version, ok, reason, cmid=cmid)
                 self._block = []
 
     def _tail(self):
@@ -1073,6 +1146,139 @@ class ContainerBackend(LinuxBackend):
             except Exception:  # noqa: BLE001
                 pass
             time.sleep(5)
+
+
+# --------------------------------------------------------------------------
+# 限流：Nimbus 算账（谁超了），宿主机上的 Steward 执法（ufw 封禁）
+# --------------------------------------------------------------------------
+# 这几段永远不封：回环与内网。KMS 客户端都是公网 IP，跳过它们不会漏掉真正的滥用，
+# 但能防止「把 127.0.0.1 封了」这种自残（容器内的自测、宿主自己连自己都会中招）。
+SKIP_DEFAULT = "127.0.0.0/8,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16"
+UNBAN_GRACE = 3600          # 解封之后一小时内不再自动封同一个 IP，免得封-解死循环
+
+
+def parse_networks(text):
+    import ipaddress
+    nets = []
+    for part in (text or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            nets.append(ipaddress.ip_network(part, strict=False))
+        except ValueError:
+            pass
+    return nets
+
+
+def is_skipped(ip, nets):
+    import ipaddress
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return True            # 认不出来的地址一律不碰
+    return any(addr in n for n in nets)
+
+
+class Limiter:
+    """按 IP 与机器码统计窗口内的激活次数，算出该封谁、该解封谁。
+
+    只做判断，不动手：防火墙的权柄留在宿主机上（Steward），Nimbus 在容器里也不该有。
+    判断是幂等的 —— 已封的 IP 不会重复出现在待封列表里。
+    """
+
+    def __init__(self, store, limit=10, window="day", ban_hours=24, skip=SKIP_DEFAULT):
+        self.store = store
+        self.limit = max(0, int(limit))
+        self.window = window if window in ("hour", "day", "total") else "day"
+        self.ban_hours = max(0, int(ban_hours))
+        self.skip_nets = parse_networks(skip)
+        self.enabled = self.limit > 0
+
+    def window_start(self):
+        now = datetime.now()
+        if self.window == "hour":
+            return int((now - timedelta(hours=1)).timestamp())
+        if self.window == "total":
+            return 0
+        return int(now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+
+    def window_text(self):
+        return {"hour": "最近 1 小时", "total": "累计"}.get(self.window, "今天")
+
+    def decide(self):
+        """返回 (待封, 待解封, 快照)。"""
+        since = self.window_start()
+        now = int(time.time())
+        state = {e["ip"]: e for e in self.store.enforce_state()}
+        banned = {ip for ip, e in state.items() if e["action"] == "ban" and e["ok"]}
+        keep = self.ban_hours * 3600
+
+        pending_unban = []
+        for ip, e in state.items():
+            if e["action"] == "unban" and not e["ok"]:
+                pending_unban.append({"ip": ip, "reason": e["reason"] or "manual",
+                                      "detail": e["detail"] or "面板上手动解封"})
+            elif e["action"] == "ban" and e["ok"] and keep and now - e["ts"] >= keep:
+                pending_unban.append({"ip": ip, "reason": "ttl",
+                                      "detail": "已封禁满 %d 小时" % self.ban_hours})
+        unbanning = {u["ip"] for u in pending_unban}
+
+        targets = {}
+        if self.enabled:
+            for row in self.store.counts(since, "ip", 500):
+                if row["n"] > self.limit and not is_skipped(row["key"], self.skip_nets):
+                    targets[row["key"]] = {"reason": "ip", "count": row["n"],
+                                           "detail": "该 IP %s内激活 %d 次"
+                                                     % (self.window_text(), row["n"])}
+            for row in self.store.counts(since, "cmid", 500):
+                if row["n"] <= self.limit or len(row["key"]) < 12:
+                    continue
+                for used in self.store.ips_of_cmid(row["key"], since):
+                    ip = used["ip"]
+                    if is_skipped(ip, self.skip_nets) or ip in targets:
+                        continue
+                    targets[ip] = {"reason": "cmid", "count": used["n"],
+                                   "detail": "机器码 %s… 在%s内被激活 %d 次"
+                                             % (row["key"][:8], self.window_text(), row["n"])}
+
+        def in_grace(ip):
+            e = state.get(ip)
+            return bool(e and e["action"] == "unban" and e["ok"]
+                        and now - e["ts"] < UNBAN_GRACE)
+
+        pending_ban = [dict(v, ip=ip) for ip, v in targets.items()
+                       if ip not in banned and ip not in unbanning and not in_grace(ip)]
+
+        return pending_ban, pending_unban, {
+            "enabled": self.enabled, "limit": self.limit, "window": self.window,
+            "window_text": self.window_text(), "ban_hours": self.ban_hours,
+            "skip": [str(n) for n in self.skip_nets], "banned": sorted(banned),
+            "pending_ban": pending_ban, "pending_unban": pending_unban,
+        }
+
+    def status(self, top=10):
+        pending_ban, pending_unban, snap = self.decide()
+        since = self.window_start()
+        snap.update({
+            "since": since, "now": int(time.time()),
+            "total": self.store.total_since(since),
+            "top_ips": [dict(r, over=self.enabled and r["n"] > self.limit,
+                             skipped=is_skipped(r["key"], self.skip_nets))
+                        for r in self.store.counts(since, "ip", top)],
+            "top_cmids": [dict(r, over=self.enabled and r["n"] > self.limit)
+                          for r in self.store.counts(since, "cmid", top)],
+            "log": self.store.enforce_log(100),
+            "state": self.store.enforce_state(),
+        })
+        return snap
+
+    def request_unban(self, ip):
+        """面板上手动解封：写一条待执行的 unban 记录，等 Steward 来取。"""
+        if not ip:
+            return {"ok": False, "error": "没给 IP"}
+        self.store.record_enforce(ip, "unban", "manual", False, "面板手动解封", "")
+        return {"ok": True, "ip": ip}
 
 
 def _sha256(path: Path):
@@ -1638,6 +1844,16 @@ class Handler(BaseHTTPRequestHandler):
                 })
             if u.path == "/api/domain":
                 return self._send(200, self.app["caddy"].status())
+            if u.path == "/api/limits":
+                return self._send(200, self.app["limiter"].status())
+            if u.path == "/api/enforce/pending":
+                # 给宿主机上的 Steward 拉的：现在就该封谁、该解封谁
+                lim = self.app["limiter"]
+                ban, unban, snap = lim.decide()
+                return self._send(200, {"ban": ban, "unban": unban, "limit": snap["limit"],
+                                        "window": snap["window"],
+                                        "window_text": snap["window_text"],
+                                        "enabled": snap["enabled"], "now": int(time.time())})
         except Exception as e:  # noqa: BLE001
             return self._send(500, {"error": str(e)})
         return self._send(404, {"error": "not found"})
@@ -1671,6 +1887,19 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, {"ok": True, "domain": domain,
                                         "a": check_a(domain),
                                         "srv": check_srv(f"_vlmcs._tcp.{domain}")})
+            if u.path == "/api/enforce/report":
+                # Steward 干完活回来汇报，把结果记进流水（否则下轮还会让它再封一次）
+                ip = (body.get("ip") or "").strip()
+                action = body.get("action") or "ban"
+                if action not in ("ban", "unban") or not ip:
+                    return self._send(400, {"ok": False, "error": "要 ip 与 action=ban|unban"})
+                self.app["store"].record_enforce(
+                    ip, action, body.get("reason") or "enforcer", bool(body.get("ok")),
+                    body.get("detail") or "", body.get("response") or "")
+                return self._send(200, {"ok": True, "ip": ip, "action": action})
+            if u.path == "/api/limits/unban":
+                return self._send(200, self.app["limiter"].request_unban(
+                    (body.get("ip") or "").strip()))
             if u.path == "/api/stats/prune":
                 return self._send(200, {"ok": True, "removed": self.app["store"].prune(),
                                         "summary": self.app["store"].summary()})
@@ -1717,6 +1946,14 @@ def main():
                     help="新建站点块时反代到哪里（默认 127.0.0.1:8099，容器里是 kms:8099）")
     ap.add_argument("--kms-host", default=os.environ.get("NIMBUS_KMS_HOST", ""),
                     help="KMS 客户端用的域名（只在界面里生成 DNS 记录时用，不参与反代）")
+    ap.add_argument("--max-activations", type=int, default=10,
+                    help="限流上限：窗口内每个 IP / 每个机器码最多激活几次（0 = 关闭限流）")
+    ap.add_argument("--limit-window", choices=["hour", "day", "total"], default="day",
+                    help="限流窗口，默认 day（当天）；total = 累计")
+    ap.add_argument("--ban-hours", type=int, default=24,
+                    help="封禁保留小时数，到点自动申请解封（0 = 不自动解封）")
+    ap.add_argument("--enforce-skip", default=SKIP_DEFAULT,
+                    help="永不封禁的网段（逗号分隔），默认回环与内网")
     args = ap.parse_args()
 
     data_dir = Path(args.data_dir).expanduser() if args.data_dir else HERE
@@ -1751,7 +1988,9 @@ def main():
     app = {"store": store, "backend": backend, "token": token, "mode": args.mode,
            "port": args.port, "started": now_iso(),
            "caddy": CaddyManager(args.caddyfile, args.caddy_admin, args.caddy_cert_dir,
-                                 args.caddy_upstream, args.kms_host)}
+                                 args.caddy_upstream, args.kms_host),
+           "limiter": Limiter(store, args.max_activations, args.limit_window,
+                              args.ban_hours, args.enforce_skip)}
     Handler.app = app
 
     # 后台配额巡检：10 分钟一次，内存不动
@@ -1785,6 +2024,9 @@ def main():
         print(f"  Caddyfile：{app['caddy'].caddyfile}"
               f"（{'可写' if app['caddy'].writable() else '只读'}）"
               f"  重载通道：{app['caddy'].reload_method()}")
+    lim = app["limiter"]
+    print(f"  限流：{'每 %s 每个 IP / 机器码 %d 次' % (lim.window_text(), lim.limit) if lim.enabled else '已关闭'}"
+          f"　封禁保留 {lim.ban_hours} 小时　跳过 {'/'.join(str(n) for n in lim.skip_nets)}")
     print("=" * 72)
     sys.stdout.flush()
     try:

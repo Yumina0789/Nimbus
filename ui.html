@@ -253,6 +253,7 @@
   <symbol id="i-sliders" viewBox="0 0 24 24"><path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/></symbol>
   <symbol id="i-server" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 7.5h.01M7 16.5h.01"/></symbol>
   <symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.5 2.6 2.5 15.4 0 18M12 3c-2.5 2.6-2.5 15.4 0 18"/></symbol>
+  <symbol id="i-ban" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M6 18L18 6"/></symbol>
   <symbol id="i-chart" viewBox="0 0 24 24"><path d="M4 20h16"/><rect x="6" y="11" width="3" height="6" rx="1"/><rect x="11" y="7" width="3" height="10" rx="1"/><rect x="16" y="13" width="3" height="4" rx="1"/></symbol>
   <symbol id="i-pulse" viewBox="0 0 24 24"><path d="M3 12h4l2.5-6 4 12L16 12h5"/></symbol>
   <symbol id="i-check" viewBox="0 0 24 24"><path d="M20 6.5 9.5 17 4 11.5"/></symbol>
@@ -318,6 +319,7 @@
       <button data-tab="config"><svg class="ico"><use href="#i-sliders"/></svg>参数</button>
       <button data-tab="service"><svg class="ico"><use href="#i-server"/></svg>服务与日志</button>
       <button data-tab="domain"><svg class="ico"><use href="#i-globe"/></svg>域名与 HTTPS</button>
+      <button data-tab="limits"><svg class="ico"><use href="#i-ban"/></svg>限流</button>
       <button data-tab="stats"><svg class="ico"><use href="#i-chart"/></svg>激活统计</button>
     </div>
   </nav>
@@ -464,6 +466,50 @@
         <span class="hint" style="font-weight:400">（保存后被面板改写的就是这份文件）</span></summary>
       <pre id="caddyBox" style="margin-top:12px"></pre>
     </details>
+  </section>
+
+  <!-- 限流 -->
+  <section id="tab-limits" class="hidden">
+    <div class="grid g4" style="margin-bottom:var(--gap)">
+      <div class="stat glass"><div class="k"><svg class="ico"><use href="#i-shield"/></svg>限流规则</div>
+        <div class="v" style="font-size:16px" id="lmRule">–</div><div class="n" id="lmRuleNote">–</div></div>
+      <div class="stat glass"><div class="k"><svg class="ico"><use href="#i-ban"/></svg>已封禁</div>
+        <div class="v" id="lmBanned">–</div><div class="n" id="lmBannedNote">–</div></div>
+      <div class="stat glass"><div class="k"><svg class="ico"><use href="#i-chart"/></svg>窗口内激活</div>
+        <div class="v" id="lmTotal">–</div><div class="n" id="lmTotalNote">–</div></div>
+      <div class="stat glass"><div class="k"><svg class="ico"><use href="#i-broom"/></svg>待执行</div>
+        <div class="v" id="lmPending">–</div><div class="n" id="lmPendingNote">–</div></div>
+    </div>
+    <div class="panel glass">
+      <h2><svg class="ico"><use href="#i-ban"/></svg>限流判定
+        <span class="q">Nimbus 只算账；封禁由宿主机上的 Steward 用 ufw 执行（防火墙权柄留在宿主机）</span>
+        <span class="end" id="lmMeta"></span></h2>
+      <div class="grid g2">
+        <div>
+          <h2><svg class="ico"><use href="#i-globe"/></svg>按 IP 排行</h2>
+          <div class="scroll" style="max-height:330px"><table>
+            <thead><tr><th>IP</th><th class="num">激活</th><th>状态</th><th class="num">处置</th></tr></thead>
+            <tbody id="lmIps"></tbody></table></div>
+        </div>
+        <div>
+          <h2><svg class="ico"><use href="#i-cpu"/></svg>按机器码排行</h2>
+          <div class="scroll" style="max-height:330px"><table>
+            <thead><tr><th>机器码</th><th class="num">激活</th><th>状态</th></tr></thead>
+            <tbody id="lmCmids"></tbody></table></div>
+        </div>
+      </div>
+      <details style="margin-top:12px">
+        <summary class="hint" style="cursor:pointer">它是怎么判的？点开看规则</summary>
+        <div class="hint" id="lmHow" style="margin-top:10px;line-height:1.75"></div>
+      </details>
+    </div>
+    <div class="panel glass">
+      <h2><svg class="ico"><use href="#i-file"/></svg>执法流水
+        <span class="end" id="lmLogMeta"></span></h2>
+      <div class="scroll" style="max-height:380px"><table>
+        <thead><tr><th>时间</th><th>IP</th><th>动作</th><th>原因</th><th>结果</th><th>说明</th></tr></thead>
+        <tbody id="lmLog"></tbody></table></div>
+    </div>
   </section>
 
   <!-- 激活统计 -->
@@ -887,6 +933,70 @@ async function checkDomain(){
   toast(a.ok ? "DNS 检查完成" : "DNS 检查完成，存在问题", !a.ok);
 }
 
+/* --- 限流 -------------------------------------------------------------- */
+const LM_REASON = {ip: "IP 超限", cmid: "机器码超限", ttl: "到期解封", manual: "手动解封",
+                   enforcer: "执行器"};
+async function loadLimits(){
+  const j = await api("/api/limits");
+  document.getElementById("lmRule").textContent = j.enabled
+    ? ("每 " + j.window_text + " " + j.limit + " 次") : "已关闭";
+  document.getElementById("lmRule").className = "v " + (j.enabled ? "" : "warn-v");
+  document.getElementById("lmRuleNote").textContent =
+    "封禁保留 " + j.ban_hours + " 小时后自动解封";
+  document.getElementById("lmBanned").textContent = num((j.banned || []).length);
+  document.getElementById("lmBanned").className = "v " + ((j.banned || []).length ? "bad-v" : "ok-v");
+  document.getElementById("lmBannedNote").textContent = (j.banned || []).join("、") || "当前没有被封的 IP";
+  document.getElementById("lmTotal").textContent = num(j.total);
+  document.getElementById("lmTotalNote").textContent = "窗口：" + j.window_text +
+    "（起于 " + new Date(j.since * 1000).toLocaleString("zh-CN") + "）";
+  const pb = (j.pending_ban || []).length, pu = (j.pending_unban || []).length;
+  document.getElementById("lmPending").textContent = (pb + pu) ? (pb + " 封 / " + pu + " 解") : "无";
+  document.getElementById("lmPendingNote").textContent = j.enabled
+    ? "等 Steward 来取（每 60 秒一轮）" : "限流关闭时不会产生待执行";
+  document.getElementById("lmMeta").textContent = "跳过网段：" + (j.skip || []).join(" ");
+
+  document.getElementById("lmIps").innerHTML = (j.top_ips || []).map(x =>
+    `<tr><td class="mono">${esc(x.key)}</td><td class="num">${num(x.n)}</td>
+      <td>${x.skipped ? '<span class="tag mute">内网/回环，不封</span>'
+            : x.over ? '<span class="tag bad">超限</span>'
+            : (j.banned || []).includes(x.key) ? '<span class="tag bad">已封</span>'
+            : '<span class="tag ok">正常</span>'}</td>
+      <td class="num">${(j.banned || []).includes(x.key)
+        ? `<button class="act ghost mini" onclick="unbanIp('${esc(x.key)}')">解封</button>`
+        : "–"}</td></tr>`).join("") || '<tr><td colspan="4" class="empty">窗口内还没有激活</td></tr>';
+
+  document.getElementById("lmCmids").innerHTML = (j.top_cmids || []).map(x =>
+    `<tr><td class="mono">${esc((x.key || "").slice(0, 8))}…</td><td class="num">${num(x.n)}</td>
+      <td>${x.over ? '<span class="tag bad">超限</span>' : '<span class="tag ok">正常</span>'}</td>
+      </tr>`).join("") || '<tr><td colspan="3" class="empty">窗口内还没有机器码</td></tr>';
+
+  document.getElementById("lmLog").innerHTML = (j.log || []).map(e =>
+    `<tr><td class="mono hint">${esc(new Date(e.ts * 1000).toLocaleString("zh-CN"))}</td>
+      <td class="mono">${esc(e.ip)}</td>
+      <td>${e.action === "ban" ? '<span class="tag bad">封禁</span>' : '<span class="tag ok">解封</span>'}</td>
+      <td class="hint">${esc(LM_REASON[e.reason] || e.reason)}</td>
+      <td>${e.ok ? '<span class="tag ok">成功</span>' : '<span class="tag warn">待执行</span>'}</td>
+      <td class="hint" title="${esc(e.response)}">${esc(e.detail || e.response || "")}</td></tr>`
+    ).join("") || '<tr><td colspan="6" class="empty">还没有执法记录</td></tr>';
+  document.getElementById("lmLogMeta").textContent = (j.log || []).length + " 条";
+
+  document.getElementById("lmHow").innerHTML =
+    "① 同一个 IP 在" + esc(j.window_text) + "内激活超过 <b>" + j.limit + "</b> 次 → 列入待封；<br>" +
+    "② 同一个机器码（CMID）超过 <b>" + j.limit + "</b> 次 → 把用过它的那些 IP 一起列入待封" +
+    "（同一个机器码被搬来搬去刷，就是这种特征）；<br>" +
+    "③ <b>回环与内网永远不封</b>（" + esc((j.skip || []).join("、")) + "）—— KMS 客户端都是公网 IP，" +
+    "跳过它们不会漏掉滥用，但能防止把 127.0.0.1 封了这种自残；<br>" +
+    "④ 已封的不会重复下发给执行器；Steward 执行完会回报，流水里能看到结果；<br>" +
+    "⑤ 封满 " + j.ban_hours + " 小时自动申请解封；手动解封后有一小时冷静期，免得封—解死循环。<br>" +
+    "执行器只认可白名单动作 —— 它拿到的是一条「封这个 IP」的请求，命令仍是它自己写死的 ufw 规则。";
+}
+async function unbanIp(ip){
+  if(!confirm("解封 " + ip + " ？\n\n会写一条待执行记录，Steward 下一轮（最多 60 秒）执行 ufw 删除封禁。")) return;
+  const j = await api("/api/limits/unban", {method:"POST", body: JSON.stringify({ip})});
+  toast(j.ok ? "已提交解封：" + esc(ip) : esc(j.error || "失败"), !j.ok);
+  loadLimits();
+}
+
 /* --- 激活统计 ---------------------------------------------------------- */
 function stDebounce(){ clearTimeout(stTimer); stTimer = setTimeout(() => loadStats(1), 350); }
 async function loadStats(page, keepScroll){
@@ -982,11 +1092,12 @@ function setStatsAuto(on){
 }
 document.querySelectorAll("nav button").forEach(b => b.onclick = () => {
   document.querySelectorAll("nav button").forEach(x => x.classList.toggle("active", x === b));
-  for(const id of ["overview","config","service","domain","stats"])
+  for(const id of ["overview","config","service","domain","limits","stats"])
     document.getElementById("tab-" + id).classList.toggle("hidden", id !== b.dataset.tab);
   if(b.dataset.tab === "stats"){ loadStats(stPage); setStatsAuto(true); }
   else setStatsAuto(false);
   if(b.dataset.tab === "domain") loadDomain();
+  if(b.dataset.tab === "limits") loadLimits();
 });
 
 /* --- 入口 ------------------------------------------------------------- */
