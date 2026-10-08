@@ -67,20 +67,43 @@ FIELD_SCHEMA = [
      "flag": "-L", "help": "格式 IP:端口，可留空只按端口监听"},
     {"key": "MaxWorkers", "label": "最大并发任务", "type": "int", "min": 1, "max": 4096,
      "default": 256, "flag": "-m", "help": "同时处理的客户端上限；1 核小机器 64 也够"},
-    {"key": "MaxIdleTime", "label": "空闲断开（秒）", "type": "int", "min": 1, "max": 3600,
-     "default": 30, "flag": "-t", "help": "客户端空闲多久后被断开"},
-    {"key": "WhitelistingLevel", "label": "白名单/严格模式", "type": "choice", "default": "0",
-     "flag": "-K", "choices": [["0", "0 - 应答未知产品（推荐）"], ["1", "1 - 只应答已知 KMSID"], ["2", "2 - 更严格"]],
+    # ini 里的键名偶尔和命令行上的不一样（vlmcsd 自己的叫法是 ConnectionTimeout /
+    # WhiteListingLevel / LogVerbose），所以 ini 名单独给一个字段，写 ini 时用它。
+    {"key": "MaxIdleTime", "ini": "ConnectionTimeout", "label": "空闲断开（秒）", "type": "int",
+     "min": 1, "max": 3600, "default": 30, "flag": "-t",
+     "help": "客户端空闲多久后被断开；vlmcsd 的 ini 里这个键叫 ConnectionTimeout"},
+    {"key": "WhitelistingLevel", "ini": "WhiteListingLevel", "label": "白名单/严格模式", "type": "choice",
+     "default": "0", "flag": "-K",
+     "choices": [["0", "0 - 应答未知产品（推荐）"], ["1", "1 - 只应答已知 KMSID"], ["2", "2 - 更严格"]],
      "help": "收紧后客户端报未知产品会被拒绝"},
     {"key": "CheckClientTime", "label": "校验客户端时钟", "type": "bool", "default": False,
      "flag": "-c", "help": "开启后客户端时间偏差过大将被拒绝"},
     {"key": "LogFile", "label": "日志目标", "type": "str", "default": "syslog",
      "flag": "-l", "help": "syslog 或文件路径"},
-    {"key": "LogLevel", "label": "日志详细度", "type": "choice", "default": "3",
-     "flag": "-v", "choices": [["0", "0 - 只报错误"], ["1", "1 - 简要"], ["3", "3 - 常规（推荐）"], ["4", "4 - 详细"]],
-     "help": "统计功能需要至少 1"},
+    {"key": "LogVerbose", "label": "详细日志", "type": "bool", "default": True, "flag": "-v",
+     "help": "vlmcsd 的 -v 开关：激活统计靠它打出的逐条明细，关掉统计就只剩空壳"},
 ]
 DEMO_CONFIG = {f["key"]: f["default"] for f in FIELD_SCHEMA}
+FIELD_BY_KEY = {f["key"]: f for f in FIELD_SCHEMA}
+INI_NAME = {f["key"]: f.get("ini", f["key"]) for f in FIELD_SCHEMA}
+KEY_BY_INI = {v.lower(): k for k, v in INI_NAME.items()}
+# 历史遗留：早期版本往 ini 里写过这两个键名，vlmcsd 并不认识它们（启动时打
+# "Unknown keyword" 警告，设置其实完全没生效）。重写 ini 时直接丢掉。
+LEGACY_INI_KEYS = {"maxidletime", "loglevel"}
+
+
+def truthy(v):
+    """把界面上 / ini 里的各种真假写法归一。"""
+    if isinstance(v, bool):
+        return v
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
+
+
+def ini_value(field, value):
+    """把界面上的值写成 vlmcsd.ini 认的写法（布尔统一写 1/0）。"""
+    if field["type"] == "bool":
+        return "1" if truthy(value) else "0"
+    return str(value)
 
 PRODUCTS = [
     ("Windows 10 Pro", "03612-00206-496-93381-03-1033-7601.0000-2322023"),
@@ -419,10 +442,17 @@ class DemoBackend:
 
     def execstart(self):
         c = self.config
-        return (f"/usr/local/bin/vlmcsd -D -e -T0 -P {c['Port']} -L {c['Listen']} "
-                f"-m {c['MaxWorkers']} -t {c['MaxIdleTime']} "
-                f"-K{c['WhitelistingLevel']} -c{1 if c['CheckClientTime'] else 0} "
-                f"-l {c['LogFile']} -v {c['LogLevel']}")
+        # -v 是无参开关，不能写成 "-v 3"（那样 vlmcsd 会当成多余的参数直接报用法退出）
+        cmd = [f"/usr/local/bin/vlmcsd -D -e -T0 -P {c['Port']}",
+               f"-L {c['Listen']}",
+               f"-m {c['MaxWorkers']}",
+               f"-t {c['MaxIdleTime']}",
+               f"-K{c['WhitelistingLevel']}",
+               f"-c{1 if truthy(c['CheckClientTime']) else 0}",
+               f"-l {c['LogFile']}"]
+        if truthy(c.get("LogVerbose", True)):
+            cmd.append("-v")
+        return " ".join(cmd)
 
 
 # --------------------------------------------------------------------------
@@ -442,6 +472,7 @@ class LinuxBackend:
         self.INI = Path(ini) if ini else self.INI
         self.log_lines = []
         self.previous = None
+        self._ini_extra = []
         self._tail_thread = None
         self.available = self._detect_service()
         threading.Thread(target=self._tail, daemon=True).start()
@@ -471,20 +502,36 @@ class LinuxBackend:
     # --- ini -------------------------------------------------------------
     def read_config(self):
         cfg = dict(DEMO_CONFIG)
+        self._ini_extra = []
         if self.INI.exists():
             for line in self.INI.read_text(encoding="utf-8", errors="replace").splitlines():
                 line = line.strip()
                 if not line or line.startswith(("#", ";")) or "=" not in line:
                     continue
                 k, v = line.split("=", 1)
-                cfg[k.strip()] = v.strip()
+                if k.strip().lower() in LEGACY_INI_KEYS:
+                    continue
+                key = KEY_BY_INI.get(k.strip().lower())
+                if not key:
+                    self._ini_extra.append((k.strip(), v.strip()))
+                    continue
+                v = v.strip()
+                cfg[key] = truthy(v) if FIELD_BY_KEY[key]["type"] == "bool" else v
         return cfg
 
     def _write_ini(self, cfg):
         body = ["; managed by nimbus", f"; updated {now_iso()}", ""]
         for f in FIELD_SCHEMA:
             body.append(f"; {f['help']}")
-            body.append(f"{f['key']} = {cfg.get(f['key'], f['default'])}")
+            body.append(f"{INI_NAME[f['key']]} = {ini_value(f, cfg.get(f['key'], f['default']))}")
+            body.append("")
+        # 面板没暴露的键（RandomizationLevel / ActivationInterval / KmsData ...）
+        # 原样写回：保存一次参数就把手写的高级配置抹掉，是绝对不能接受的。
+        extra = getattr(self, "_ini_extra", [])
+        if extra:
+            body.append("; 以下键由手工维护，面板只读不写")
+            for k, v in extra:
+                body.append(f"{k} = {v}")
             body.append("")
         tmp = Path(str(self.INI) + ".tmp")
         tmp.write_text("\n".join(body), encoding="utf-8")
@@ -751,8 +798,37 @@ class ContainerBackend(LinuxBackend):
                 out.append({"t": "", "level": self._level_of(line), "msg": line})
         return out
 
+    # vlmcsd 的一次激活在日志里是一个块，形如：
+    #   IPv4 connection accepted: 10.0.0.5:52211.
+    #   <<< Incoming KMS request
+    #   Application ID                  : <guid> (Windows 10 Pro)
+    #   Client machine ID               : <guid>
+    #   >>> Sending response, ePID source = randomized at program start
+    #   IPv4 connection closed: 10.0.0.5:52211.
+    # 所以按块解析，而不是按单行正则。
+    ACCEPT_RE = re.compile(r"IPv4 connection accepted: (?P<ip>[\d.]+):(?P<port>\d+)")
+    CLOSE_RE = re.compile(r"IPv4 connection closed: (?P<ip>[\d.]+):\d+")
+    PRODUCT_RE = re.compile(r"Application ID\s*:\s*\S+\s*\((?P<product>[^)]+)\)")
+    SENT_RE = re.compile(r">>>\s*Sending response")
+    REJECT_RE = re.compile(r"(reject|not licensed|error|fail)", re.I)
+
+    def _event_from_block(self, block):
+        """把一个连接块变成一条统计记录；不是一个完整块就返回 None。"""
+        m = self.ACCEPT_RE.search(block)
+        if not m:
+            return None
+        ip = m.group("ip")
+        ok = bool(self.SENT_RE.search(block))
+        p = self.PRODUCT_RE.search(block)
+        product = p.group("product") if p else ""
+        reason = ""
+        if not ok:
+            bad = [ln for ln in block.splitlines() if self.REJECT_RE.search(ln)]
+            reason = (bad[0] if bad else block.strip().splitlines()[-1] if block.strip() else "")[:120]
+        return ip, product, ok, reason
+
     def _tail(self):
-        """按行 tail -F 日志文件（代替 journalctl -f）。"""
+        """tail -F 日志文件，按"连接块"累计并入库（代替 journalctl -f + 单行正则）。"""
         while True:
             try:
                 self.log_file.parent.mkdir(parents=True, exist_ok=True)
@@ -760,6 +836,7 @@ class ContainerBackend(LinuxBackend):
                 with self.log_file.open("r", encoding="utf-8", errors="replace") as fh:
                     fh.seek(0, os.SEEK_END)
                     buf = ""
+                    block = []
                     while True:
                         chunk = fh.read()
                         if not chunk:
@@ -777,15 +854,21 @@ class ContainerBackend(LinuxBackend):
                             line = line.rstrip()
                             if not line:
                                 continue
-                            m = self.EVENT_RE.search(line)
-                            if m:
-                                ok = m.group("verdict").lower() == "success"
-                                self.store.add(int(time.time()), m.group("ip"), m.group("product"),
-                                               "", ok, "" if ok else line[-80:])
                             self.log_lines.append({"t": now_iso(),
                                                    "level": self._level_of(line),
                                                    "msg": line})
                             del self.log_lines[:-400]
+                            if self.ACCEPT_RE.search(line):
+                                block = [line]
+                                continue
+                            if block:
+                                block.append(line)
+                                if self.CLOSE_RE.search(line):
+                                    ev = self._event_from_block("\n".join(block))
+                                    if ev:
+                                        ip, product, ok, reason = ev
+                                        self.store.add(int(time.time()), ip, product, "", ok, reason)
+                                    block = []
             except Exception:
                 pass
             time.sleep(5)

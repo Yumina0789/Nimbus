@@ -626,7 +626,7 @@ const GROUPS = [
   ["网络", "network", ["Port", "Listen"]],
   ["并发与超时", "clock", ["MaxWorkers", "MaxIdleTime"]],
   ["策略", "shield", ["WhitelistingLevel", "CheckClientTime"]],
-  ["日志", "file", ["LogFile", "LogLevel"]]
+  ["日志", "file", ["LogFile", "LogVerbose"]]
 ];
 function renderForm(){
   const byKey = Object.fromEntries(SCHEMA.map(f => [f.key, f]));
