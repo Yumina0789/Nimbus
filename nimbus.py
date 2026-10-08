@@ -54,7 +54,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
-VERSION = "0.1.0-demo"
+VERSION = "0.1.0"
 HERE = Path(__file__).resolve().parent
 
 # --------------------------------------------------------------------------
