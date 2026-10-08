@@ -627,6 +627,10 @@ class ContainerBackend(LinuxBackend):
 
     manager = "supervisord"
     PROGRAM = "vlmcsd"
+    # supervisorctl 是独立进程，只认 -c 指定的那份配置。alpine 里主配置不在
+    # supervisorctl 的默认查找路径上，不显式传它就会去找 /run/supervisord.sock
+    # （不存在），于是所有状态查询都失败。
+    SUPERVISOR_CONF = "/etc/supervisor/supervisord.conf"
 
     def __init__(self, store, unit="", ini="", log_file=""):
         self.log_file = Path(log_file) if log_file else Path("/var/log/vlmcsd.log")
@@ -634,8 +638,12 @@ class ContainerBackend(LinuxBackend):
 
     # --- supervisorctl 基础调用 ------------------------------------------
     def _sup(self, *argv, timeout=20):
+        cmd = ["supervisorctl"]
+        conf = Path(self.SUPERVISOR_CONF)
+        if conf.exists():
+            cmd += ["-c", str(conf)]
         try:
-            r = subprocess.run(["supervisorctl", *argv], capture_output=True,
+            r = subprocess.run(cmd + list(argv), capture_output=True,
                                text=True, timeout=timeout)
         except (OSError, subprocess.SubprocessError) as e:
             return None, f"supervisorctl 调用失败：{e}"

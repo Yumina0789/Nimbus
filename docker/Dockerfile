@@ -17,6 +17,25 @@ LABEL org.opencontainers.image.title="Nimbus" \
 # supervisor 管两个进程；curl 用来取 vlmcsd 的静态二进制
 RUN apk add --no-cache supervisor curl tzdata
 
+# alpine 的 supervisor 包不带主配置（那是 Debian 的习惯），自己写一份：
+# 前台运行 + 把 conf.d 收进来。
+RUN mkdir -p /etc/supervisor/conf.d /run \
+ && printf '%s\n' \
+      '[supervisord]' \
+      'nodaemon=true' \
+      'logfile=/dev/null' \
+      'logfile_maxbytes=0' \
+      'pidfile=/run/supervisord.pid' \
+      '[unix_http_server]' \
+      'file=/run/supervisor.sock' \
+      '[supervisorctl]' \
+      'serverurl=unix:///run/supervisor.sock' \
+      '[rpcinterface:supervisor]' \
+      'supervisor.rpcinterface_factory = supervisor.rpcinterface:make_main_rpcinterface' \
+      '[include]' \
+      'files = /etc/supervisor/conf.d/*.conf' \
+      > /etc/supervisor/supervisord.conf
+
 # vlmcsd / vlmcs 是 musl 静态二进制（由 vlmcsd 部署项目发布），alpine 上直接可用，
 # 不需要任何 C 运行时依赖。
 ARG RELEASE_TAG=binaries
