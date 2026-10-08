@@ -35,6 +35,7 @@ nimbus —— Nimbus 管理面板：vlmcsd KMS 服务的可视化管理界面（
 """
 
 import argparse
+import http.client
 import json
 import os
 import queue
@@ -53,6 +54,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import xmlrpc.client
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -137,6 +139,35 @@ def human_bytes(n):
         if n < 1024 or unit == "TB":
             return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
         n /= 1024.0
+
+
+def _dur_text(sec):
+    """秒数 → 「几天几小时」，给启动时间那栏用。"""
+    d, h, m = sec // 86400, sec % 86400 // 3600, sec % 3600 // 60
+    if d:
+        return "%d 天 %d 小时" % (d, h)
+    if h:
+        return "%d 小时 %d 分" % (h, m)
+    return "%d 分" % m
+
+
+# Windows 11 复用 Windows 10 的 GVLK 与 Activation ID（例如专业版都是
+# 2de67392-b7a7-462a-b1ca-108dd189f588），而 KMS 请求里**不含系统版本号**，所以
+# 服务器端根本无法区分 Win10 / Win11；vlmcsd 内置的数据表又比 Windows 11 旧，
+# 于是一律叫 "Windows 10 xxx"。基础版标成 10/11 更贴近事实；带年份、LTSB/LTSC、
+# Server、ARM64 的名字一律不动（那些确实没有 Win11 对应版本）。
+_DISPLAY_ALIAS = [
+    (re.compile(r"^Windows 10 (Home|Home N|Home Single Language|Professional|Professional N|"
+                r"Enterprise|Enterprise N|Education|Education N)$"),
+     r"Windows 10/11 \1"),
+]
+
+
+def _alias_product(name):
+    for pat, repl in _DISPLAY_ALIAS:
+        if pat.match(name):
+            return pat.sub(repl, name)
+    return name
 
 
 # --------------------------------------------------------------------------
@@ -740,13 +771,22 @@ class LinuxBackend:
         m = self.ACCEPT_RE.search(block)
         if not m:
             return None
+        lines = [l.strip() for l in block.splitlines() if l.strip()]
         if not self.PAYLOAD_RE.search(block):
-            return None
+            # 只有 accepted + closed、中间什么都没有 = 端口探活（监控、扫描器），不入库。
+            # 但中间只要还有别的行，就说明确实发生过什么：哪怕没解析出请求体也要记下来，
+            # 否则"客户端连上了但失败"会变成面板上完全看不见的空白。
+            if len(lines) <= 2:
+                return None
+            note = lines[1][:100] if len(lines) > 1 else ""
+            reason = "连接里没有 KMS 请求内容" + ("：" + note if note else "")
+            return m.group("ip"), "", "", False, reason
         ip = m.group("ip")
         ok = bool(self.SENT_RE.search(block))
         product = (self._named(self.SKU_RE.search(block))
                    or self._named(self.KMSID_RE.search(block))
                    or self._named(self.PRODUCT_RE.search(block)))
+        product = _alias_product(product)
         pv = self.PROTO_RE.search(block)
         version = ("v%s" % pv.group("ver")) if pv else ""
         reason = ""
@@ -789,6 +829,33 @@ class LinuxBackend:
             time.sleep(5)
 
 
+class _UnixRPCTransport(xmlrpc.client.Transport):
+    """让 xmlrpc.client 走 unix socket。
+
+    supervisord 的 RPC 只监听 /run/supervisor.sock。以前每次都 fork 一个
+    supervisorctl 去问状态，实测一次 0.22 秒（要起一个 Python 解释器），而面板
+    每 5 秒就要问两三次 —— 上 RPC 之后是毫秒级。
+    """
+
+    def __init__(self, path):
+        super().__init__()
+        self.path = path
+
+    def make_connection(self, host):
+        path = self.path
+
+        class _Conn(http.client.HTTPConnection):
+            def __init__(self):
+                super().__init__("localhost")
+
+            def connect(self):
+                self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                self.sock.settimeout(5)
+                self.sock.connect(path)
+
+        return _Conn()
+
+
 # --------------------------------------------------------------------------
 # 容器后端：容器里没有 systemd / journald，改用 supervisord
 # --------------------------------------------------------------------------
@@ -812,7 +879,62 @@ class ContainerBackend(LinuxBackend):
 
     def __init__(self, store, unit="", ini="", log_file=""):
         self.log_file = Path(log_file) if log_file else Path("/var/log/vlmcsd.log")
+        self._info_cache = None          # (时间戳, getProcessInfo 结果)
         super().__init__(store, unit, ini)
+
+    # --- supervisord 的 XML-RPC（热路径，比 fork supervisorctl 快两个数量级）--
+    def _supervisor_sock(self):
+        """从主配置里读 unix_http_server 的 socket 路径。"""
+        try:
+            txt = self.SUPERVISOR_CONF and Path(self.SUPERVISOR_CONF).read_text(
+                encoding="utf-8", errors="replace") or ""
+        except OSError:
+            txt = ""
+        m = re.search(r"(?ms)^\s*\[unix_http_server\]\s*$(.*?)(?=^\s*\[|\Z)", txt)
+        if m:
+            f = re.search(r"(?m)^\s*file\s*=\s*(\S+)", m.group(1))
+            if f:
+                return f.group(1)
+        return "/run/supervisor.sock"
+
+    def _sup_rpc(self):
+        """连不上就返回 None，调用方自动退回 supervisorctl。"""
+        sock = self._supervisor_sock()
+        try:
+            if not Path(sock).exists():
+                return None
+            return xmlrpc.client.ServerProxy("http://localhost/RPC2",
+                                             transport=_UnixRPCTransport(sock))
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _process_info(self):
+        """getProcessInfo 的结果，缓存 1.5 秒（一次页面刷新会问好几次状态）。"""
+        now = time.time()
+        if self._info_cache and now - self._info_cache[0] < 1.5:
+            return self._info_cache[1]
+        info = None
+        proxy = self._sup_rpc()
+        if proxy is not None:
+            try:
+                info = dict(proxy.supervisor.getProcessInfo(self.PROGRAM))
+            except Exception:  # noqa: BLE001
+                info = None
+        if info is None:
+            r, _ = self._sup("status", self.PROGRAM, timeout=10)
+            if r is None or r.returncode != 0:
+                self._info_cache = (now, None)
+                return None
+            out = r.stdout or ""
+            state = re.search(r"\b(RUNNING|STOPPED|STARTING|BACKOFF|STOPPING|EXITED|FATAL)\b", out)
+            pid = re.search(r"pid (\d+)", out)
+            up = re.search(r"uptime (\d+):(\d+):(\d+)", out)
+            secs = (int(up.group(1)) * 3600 + int(up.group(2)) * 60 + int(up.group(3))) if up else 0
+            info = {"statename": state.group(1) if state else "UNKNOWN",
+                    "pid": int(pid.group(1)) if pid else 0,
+                    "start": int(now - secs) if secs else 0}
+        self._info_cache = (now, info)
+        return info
 
     # --- supervisorctl 基础调用 ------------------------------------------
     def _sup(self, *argv, timeout=20):
@@ -832,6 +954,8 @@ class ContainerBackend(LinuxBackend):
         return subprocess.CompletedProcess(argv, returncode, stdout, stderr)
 
     def _detect_service(self) -> bool:
+        if self._process_info() is not None:
+            return True
         if not shutil.which("supervisorctl"):
             return False
         r, _ = self._sup("status", self.PROGRAM, timeout=10)
@@ -861,30 +985,30 @@ class ContainerBackend(LinuxBackend):
             return self._sup("status", self.PROGRAM, timeout=timeout)
 
         if action == "is-active":
-            r, err = self._sup("status", self.PROGRAM, timeout=timeout)
-            if r is None:
-                return None, err
-            active = bool(re.search(r"\bRUNNING\b", r.stdout or ""))
+            info = self._process_info()
+            if info is None:
+                return None, "supervisord 里没有名为 %s 的程序" % self.PROGRAM
+            active = info.get("statename") == "RUNNING"
             return self._done(argv, 0 if active else 3,
-                              "active\n" if active else "inactive\n", err), err
+                              "active\n" if active else "inactive\n"), ""
 
         if action == "show":
             props = [a for a in rest if not a.startswith("-")]
-            r, err = self._sup("status", self.PROGRAM, timeout=timeout)
-            out = r.stdout if r else ""
-            pid = re.search(r"pid (\d+)", out)
-            uptime = re.search(r"uptime (.+)", out)
+            info = self._process_info() or {}
             lines = []
             if any("MainPID" in p for p in props):
-                lines.append("MainPID=%s" % (pid.group(1) if pid else "0"))
+                lines.append("MainPID=%s" % (info.get("pid") or 0))
             if any("ActiveEnterTimestamp" in p for p in props):
+                start = info.get("start") or 0
                 since = ""
-                if uptime:
-                    since = "%s (up %s)" % (now_iso(), uptime.group(1).strip())
+                if start:
+                    since = "%s (up %s)" % (
+                        datetime.fromtimestamp(start).strftime("%Y-%m-%d %H:%M:%S"),
+                        _dur_text(int(time.time() - start)))
                 lines.append("ActiveEnterTimestamp=%s" % since)
             if any("ExecStart" in p for p in props):
                 lines.append("ExecStart=%s" % self._command_line())
-            return self._done(argv, 0, "\n".join(lines) + "\n", err), err
+            return self._done(argv, 0, "\n".join(lines) + "\n"), ""
 
         if action in ("start", "stop", "restart"):
             return self._sup(action, self.PROGRAM, timeout=timeout)
@@ -1488,6 +1612,7 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/meta":
             return self._send(200, {"version": VERSION, "mode": self.app["mode"],
                                     "schema": FIELD_SCHEMA, "real": self.app["backend"].real,
+                                    "kms_host": self.app["caddy"].kms_host,
                                     "started": self.app["started"]})
         if not self._authed(q):
             return self._send(401, {"error": "unauthorized", "hint": "需要 token"})
