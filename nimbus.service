@@ -66,9 +66,10 @@ StateDirectory=nimbus
 StateDirectoryMode=0700
 
 # --- Hardening ---------------------------------------------------------------
-# Requires a reasonably recent systemd: ProtectProc= needs >= 247,
-# ProtectClock/ProtectHostname >= 245, ProtectKernelLogs >= 244,
-# ProtectKernelTunables/Modules and RestrictNamespaces >= 232.
+# Requires systemd >= 245 (Ubuntu 20.04 ships exactly 245): ProtectClock and
+# ProtectHostname need 245, ProtectKernelLogs 244, ProtectKernelTunables/Modules
+# and RestrictNamespaces 232. ProtectProc= (247+) is deliberately NOT used here:
+# on older systemd it is an unknown key that only produces noise.
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
@@ -79,7 +80,6 @@ ProtectKernelLogs=yes
 ProtectControlGroups=yes
 ProtectClock=yes
 ProtectHostname=yes
-ProtectProc=invisible
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 RestrictNamespaces=yes
 LockPersonality=yes
@@ -90,9 +90,14 @@ SystemCallErrorNumber=EPERM
 CapabilityBoundingSet=
 AmbientCapabilities=
 
-# Only these three paths may be written while ProtectSystem=strict is active.
-# install.sh rewrites this line when --ini points somewhere else.
-ReadWritePaths=@INI@ @INI@.bak @INI@.tmp
+# The panel rewrites the vlmcsd ini in place and keeps .bak/.tmp copies next to
+# it, so the whole directory has to stay writable. A ReadWritePaths entry that
+# does not exist makes systemd fail to set up the mount namespace
+# (status=226/NAMESPACE), so the directory is used instead of the file.
+# ProtectSystem=strict still keeps everything outside /etc read-only.
+# The installer records the path it detected here for the operator's benefit.
+# detected vlmcsd ini: @INI@
+ReadWritePaths=/etc
 
 [Install]
 WantedBy=multi-user.target
