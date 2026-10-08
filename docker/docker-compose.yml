@@ -20,7 +20,8 @@ services:
       - "1688:1688"            # KMS：直接暴露裸 TCP，不经 Caddy
       - "127.0.0.1:8099:8099"  # 面板：只绑本机，由 Caddy 反代（想直连可改成 0.0.0.0）
     volumes:
-      - kms-data:/var/lib/nimbus   # SQLite 统计库 + token
+      - kms-data:/var/lib/nimbus        # SQLite 统计库 + token（容器重建也不丢）
+      - /etc/vlmcsd:/etc/vlmcsd         # vlmcsd 的 ini 留在宿主上：运维看得见、改得动
     environment:
       - TZ=Asia/Shanghai
       - VLMCSD_INI=/etc/vlmcsd/vlmcsd.ini
