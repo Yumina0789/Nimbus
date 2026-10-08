@@ -221,6 +221,7 @@
   #login{position:fixed;inset:0;z-index:90;display:grid;place-items:center;
          background:var(--overlay);-webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px)}
   #login .box{width:min(390px,92vw);padding:20px}
+  #login code{font-size:11px;overflow-wrap:anywhere;color:var(--text)}
   .hidden{display:none !important}
   @media (max-width:640px){
     .hbar{margin:0 10px} nav{margin:8px 10px 0} main{padding:14px 12px 56px}
@@ -271,7 +272,10 @@
     <div class="field">
       <label>访问 token</label>
       <input id="loginToken" type="password" placeholder="启动时终端输出的一串 token">
-      <div class="hint">token 保存在服务器 nimbus.token（权限 600）。</div>
+      <div class="hint">在服务器上取：<code class="mono">docker exec kms cat /var/lib/nimbus/nimbus.token</code><br>
+        非容器安装就是 <code class="mono">cat /var/lib/nimbus/nimbus.token</code>。<br>
+        更省事的办法：用带 token 的地址打开，例如
+        <code class="mono">https://你的域名/?token=这串token</code>，登录状态会记在这个浏览器里。</div>
     </div>
     <button class="act" style="width:100%" onclick="doLogin()">
       <svg class="ico"><use href="#i-check"/></svg>登录</button>

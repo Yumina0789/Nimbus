@@ -1295,13 +1295,28 @@ class CaddyManager:
         return info
 
     # --- 汇总给界面 --------------------------------------------------------
+    def site_host(self):
+        """从 Caddyfile 的第一个站点块里取出地址，返回 (原文地址, 纯主机名)。"""
+        text = self.read()
+        info = self.parse(text)
+        raw = info["domains"][0] if info["domains"] else ""
+        host = re.sub(r"^[a-z][a-z0-9+.-]*://", "", raw).split(":")[0].strip().lower()
+        if not re.match(r"^[a-z0-9.\-]+$", host):
+            host = ""
+        return raw, host
+
+    def public_url(self, token):
+        """面板对外的入口（带 token，点开即登录）。没配域名就返回空串。"""
+        raw, host = self.site_host()
+        if not host or "." not in host:
+            return ""
+        scheme = "http" if raw.startswith("http://") else "https"
+        return "%s://%s/?token=%s" % (scheme, host, token)
+
     def status(self):
         text = self.read()
         info = self.parse(text)
-        raw_addr = info["domains"][0] if info["domains"] else ""
-        host = re.sub(r"^[a-z][a-z0-9+.-]*://", "", raw_addr).split(":")[0].strip().lower()
-        if not re.match(r"^[a-z0-9.\-]+$", host):
-            host = ""
+        raw_addr, host = self.site_host()
         method = self.reload_method() if self.configured() else "manual"
         a = check_a(host) if host else {"ok": False, "values": [], "error": "还没有配置域名"}
         # 没配域名时用占位符生成示例，别让 DNS 表里出现空名字
@@ -1553,7 +1568,11 @@ def main():
     print("=" * 72)
     print(f"  nimbus {VERSION}  [{args.mode} 模式]")
     print(f"  打开这个地址（已带 token）：{url}")
+    public_url = app["caddy"].public_url(token)
+    if public_url:
+        print(f"  公网入口（直接点/收藏这个）：{public_url}")
     print(f"  纯 token：{token}")
+    print(f"  忘了 token 就跑：cat {token_file}")
     print(f"  统计库：{db_path}   配额 {human_bytes(store.quota_bytes)}")
     if args.mode == "real":
         print(f"  进程管理：{backend.manager}（单元/程序：{args.unit}）")
