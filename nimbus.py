@@ -431,6 +431,7 @@ class DemoBackend:
 # --------------------------------------------------------------------------
 class LinuxBackend:
     real = True
+    manager = "systemd"          # 面板上显示用的进程管理器名
     # 被管理程序的默认身份；可用 --unit / --ini 覆盖，改的只是"去哪里找 vlmcsd"
     UNIT = "vlmcsd"
     INI = Path("/etc/vlmcsd.ini")
@@ -525,6 +526,7 @@ class LinuxBackend:
         if not self.available:
             return {
                 "available": False, "unit": self.UNIT, "ini": str(self.INI),
+                "manager": self.manager,
                 "running": False, "pid": None, "since": None, "uptime": None,
                 "version": None, "binary": None, "sha256": None,
                 "reload_pending": False, "hint": self._missing_hint(),
@@ -538,6 +540,7 @@ class LinuxBackend:
         since = re.search(r"ActiveEnterTimestamp=(.+)", info)
         return {
             "available": True, "unit": self.UNIT, "ini": str(self.INI),
+            "manager": self.manager,
             "running": active == "active",
             "pid": int(pid.group(1)) if pid and pid.group(1) != "0" else None,
             "since": since.group(1).strip() if since else None,
@@ -603,6 +606,178 @@ class LinuxBackend:
                                            "level": "warn" if re.search(r"reject|error", line, re.I) else "info",
                                            "msg": line})
                     del self.log_lines[:-400]
+            except Exception:
+                pass
+            time.sleep(5)
+
+
+# --------------------------------------------------------------------------
+# 容器后端：容器里没有 systemd / journald，改用 supervisord
+# --------------------------------------------------------------------------
+class ContainerBackend(LinuxBackend):
+    """supervisord 版真机后端（Docker 部署用）。
+
+    容器里既没有 systemd 也没有 journald，所以：
+      * 进程控制走 supervisorctl —— 这里把父类使用的 systemctl 语义就地翻译
+        过去，因此父类的 save_config / rollback / service / status / execstart
+        一行都不用改；
+      * 日志改成读文件（vlmcsd 用 "-l /var/log/vlmcsd.log" 写文件），统计线程
+        用 python 按行轮询文件增量，效果等同 journalctl -f。
+    """
+
+    manager = "supervisord"
+    PROGRAM = "vlmcsd"
+
+    def __init__(self, store, unit="", ini="", log_file=""):
+        self.log_file = Path(log_file) if log_file else Path("/var/log/vlmcsd.log")
+        super().__init__(store, unit, ini)
+
+    # --- supervisorctl 基础调用 ------------------------------------------
+    def _sup(self, *argv, timeout=20):
+        try:
+            r = subprocess.run(["supervisorctl", *argv], capture_output=True,
+                               text=True, timeout=timeout)
+        except (OSError, subprocess.SubprocessError) as e:
+            return None, f"supervisorctl 调用失败：{e}"
+        return r, (r.stderr or "").strip()
+
+    @staticmethod
+    def _done(argv, returncode=0, stdout="", stderr=""):
+        return subprocess.CompletedProcess(argv, returncode, stdout, stderr)
+
+    def _detect_service(self) -> bool:
+        if not shutil.which("supervisorctl"):
+            return False
+        r, _ = self._sup("status", self.PROGRAM, timeout=10)
+        return r is not None and r.returncode == 0
+
+    def _missing_hint(self) -> str:
+        return (f"未检测到 KMS 服务：supervisord 里没有名为 {self.PROGRAM} 的程序。"
+                f"面板其余功能照常可用。")
+
+    def _command_line(self) -> str:
+        for conf in ("/etc/supervisor/conf.d/vlmcsd.conf",
+                     "/etc/supervisord.d/vlmcsd.conf"):
+            p = Path(conf)
+            if p.exists():
+                for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
+                    if line.strip().startswith("command="):
+                        return line.split("=", 1)[1].strip()
+        return f"/usr/local/bin/{self.PROGRAM} (managed by supervisord)"
+
+    # --- 把 systemctl 的调用翻译成 supervisorctl -------------------------
+    def _systemctl(self, *argv, timeout=20):
+        if not argv:
+            return None, "空调用"
+        action, rest = argv[0], list(argv[1:])
+
+        if action == "cat":
+            return self._sup("status", self.PROGRAM, timeout=timeout)
+
+        if action == "is-active":
+            r, err = self._sup("status", self.PROGRAM, timeout=timeout)
+            if r is None:
+                return None, err
+            active = bool(re.search(r"\bRUNNING\b", r.stdout or ""))
+            return self._done(argv, 0 if active else 3,
+                              "active\n" if active else "inactive\n", err), err
+
+        if action == "show":
+            props = [a for a in rest if not a.startswith("-")]
+            r, err = self._sup("status", self.PROGRAM, timeout=timeout)
+            out = r.stdout if r else ""
+            pid = re.search(r"pid (\d+)", out)
+            uptime = re.search(r"uptime (.+)", out)
+            lines = []
+            if any("MainPID" in p for p in props):
+                lines.append("MainPID=%s" % (pid.group(1) if pid else "0"))
+            if any("ActiveEnterTimestamp" in p for p in props):
+                since = ""
+                if uptime:
+                    since = "%s (up %s)" % (now_iso(), uptime.group(1).strip())
+                lines.append("ActiveEnterTimestamp=%s" % since)
+            if any("ExecStart" in p for p in props):
+                lines.append("ExecStart=%s" % self._command_line())
+            return self._done(argv, 0, "\n".join(lines) + "\n", err), err
+
+        if action in ("start", "stop", "restart"):
+            return self._sup(action, self.PROGRAM, timeout=timeout)
+
+        if action == "kill":
+            sig = "HUP"
+            if "-s" in rest and rest.index("-s") + 1 < len(rest):
+                sig = rest[rest.index("-s") + 1]
+            r, err = self._sup("signal", sig, self.PROGRAM, timeout=timeout)
+            if r is not None and r.returncode == 0:
+                return r, err
+            # supervisorctl signal 不被支持时退回直接给进程发信号
+            try:
+                pr = subprocess.run(["pkill", f"-{sig}", "-x", self.PROGRAM],
+                                    capture_output=True, text=True, timeout=10)
+                return pr, (pr.stderr or "").strip()
+            except (OSError, subprocess.SubprocessError) as e:
+                return None, f"发送 {sig} 失败：{e}"
+
+        return None, f"supervisor 后端不支持的操作：{action}"
+
+    # --- 日志：读文件而不是 journalctl -----------------------------------
+    def _level_of(self, line: str) -> str:
+        if re.search(r"error|fail|reject", line, re.I):
+            return "warn"
+        if "success" in line.lower():
+            return "ok"
+        return "info"
+
+    def logs(self, lines=200):
+        if not self.log_file.exists():
+            return [{"t": "", "level": "warn", "msg": f"日志文件还不存在：{self.log_file}"}]
+        try:
+            with self.log_file.open("r", encoding="utf-8", errors="replace") as fh:
+                tail = fh.readlines()[-lines:]
+        except OSError as e:
+            return [{"t": "", "level": "warn", "msg": f"读日志失败：{e}"}]
+        out = []
+        for line in reversed(tail):
+            line = line.rstrip()
+            if line:
+                out.append({"t": "", "level": self._level_of(line), "msg": line})
+        return out
+
+    def _tail(self):
+        """按行 tail -F 日志文件（代替 journalctl -f）。"""
+        while True:
+            try:
+                self.log_file.parent.mkdir(parents=True, exist_ok=True)
+                self.log_file.touch(exist_ok=True)
+                with self.log_file.open("r", encoding="utf-8", errors="replace") as fh:
+                    fh.seek(0, os.SEEK_END)
+                    buf = ""
+                    while True:
+                        chunk = fh.read()
+                        if not chunk:
+                            time.sleep(1)
+                            # 日志被轮转掉了就重新打开
+                            try:
+                                if fh.tell() > self.log_file.stat().st_size:
+                                    break
+                            except OSError:
+                                break
+                            continue
+                        buf += chunk
+                        while "\n" in buf:
+                            line, buf = buf.split("\n", 1)
+                            line = line.rstrip()
+                            if not line:
+                                continue
+                            m = self.EVENT_RE.search(line)
+                            if m:
+                                ok = m.group("verdict").lower() == "success"
+                                self.store.add(int(time.time()), m.group("ip"), m.group("product"),
+                                               "", ok, "" if ok else line[-80:])
+                            self.log_lines.append({"t": now_iso(),
+                                                   "level": self._level_of(line),
+                                                   "msg": line})
+                            del self.log_lines[:-400]
             except Exception:
                 pass
             time.sleep(5)
@@ -850,6 +1025,10 @@ def main():
     ap.add_argument("--retention-days", type=int, default=0)
     ap.add_argument("--unit", default="vlmcsd", help="真机模式：被管理的 systemd 单元名")
     ap.add_argument("--ini", default="/etc/vlmcsd.ini", help="真机模式：被管理的 vlmcsd 配置文件路径")
+    ap.add_argument("--supervisor", action="store_true",
+                    help="容器部署：用 supervisord 而不是 systemd 管理 vlmcsd")
+    ap.add_argument("--log-file", default="",
+                    help="配合 --supervisor：vlmcsd 的日志文件（默认 /var/log/vlmcsd.log）")
     args = ap.parse_args()
 
     data_dir = Path(args.data_dir).expanduser() if args.data_dir else HERE
@@ -860,7 +1039,12 @@ def main():
     if args.mode == "demo":
         quota = 256 << 20  # 演示模式别真吃 6 GB
     store = StatsStore(db_path, quota, args.retention_days)
-    backend = DemoBackend(store) if args.mode == "demo" else LinuxBackend(store, args.unit, args.ini)
+    if args.mode == "demo":
+        backend = DemoBackend(store)
+    elif args.supervisor:
+        backend = ContainerBackend(store, args.unit, args.ini, args.log_file)
+    else:
+        backend = LinuxBackend(store, args.unit, args.ini)
 
     token = args.token or os.environ.get("NIMBUS_ADMIN_TOKEN") or ""
     token_file = Path(args.token_file).expanduser() if args.token_file else (data_dir / "nimbus.token")
@@ -899,7 +1083,10 @@ def main():
     print(f"  纯 token：{token}")
     print(f"  统计库：{db_path}   配额 {human_bytes(store.quota_bytes)}")
     if args.mode == "real":
-        print(f"  被管理单元：{args.unit}   配置文件：{args.ini}")
+        print(f"  进程管理：{backend.manager}（单元/程序：{args.unit}）")
+        print(f"  配置文件：{args.ini}")
+        if args.supervisor:
+            print(f"  日志文件：{args.log_file or '/var/log/vlmcsd.log'}")
     print("=" * 72)
     sys.stdout.flush()
     try:

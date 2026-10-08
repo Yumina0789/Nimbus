@@ -1,0 +1,28 @@
+# Caddy 配置：只服务管理面板这一个域名。
+#
+# Caddy 会自动向 Let's Encrypt 申请并续期证书（需要 adkms.lolicon.fans 的 A 记录
+# 已经指向这台服务器，并且 80/443 从公网可达）。证书落在 caddy-data 卷里。
+#
+# KMS 本身（kms.lolicon.fans:1688）是裸 TCP，不经过 Caddy —— HTTP 反代处理不了
+# 它，客户端也不需要 HTTPS。
+
+adkms.lolicon.fans {
+	encode zstd gzip
+	reverse_proxy kms:8099
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+
+	log {
+		output file /data/access.log {
+			roll_size 10mb
+			roll_keep 3
+		}
+		format console
+	}
+}

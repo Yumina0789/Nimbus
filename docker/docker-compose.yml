@@ -1,0 +1,55 @@
+# Nimbus 的容器编排：KMS 服务 + 面板一个容器，Caddy 一个容器。
+#
+#   cd <repo>/docker
+#   docker compose up -d --build
+#
+# 关于域名：
+#   * adkms.lolicon.fans 走 Caddy 自动 HTTPS，反代到容器里的 8099；
+#   * kms.lolicon.fans 是 KMS 本身，它是**裸 TCP 1688**，Caddy 反代不了，
+#     也不需要 HTTPS —— 只要 DNS A 记录指向本机、1688 放行即可，
+#     客户端填 "slmgr /skms kms.lolicon.fans:1688"。
+services:
+  kms:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: nimbus:local
+    container_name: kms
+    hostname: kms
+    ports:
+      - "1688:1688"            # KMS：直接暴露裸 TCP，不经 Caddy
+      - "127.0.0.1:8099:8099"  # 面板：只绑本机，由 Caddy 反代（想直连可改成 0.0.0.0）
+    volumes:
+      - kms-data:/var/lib/nimbus   # SQLite 统计库 + token
+    environment:
+      - TZ=Asia/Shanghai
+      - VLMCSD_INI=/etc/vlmcsd/vlmcsd.ini
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8099/api/meta',timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: caddy
+    depends_on:
+      - kms
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data            # 证书存在这里，别删
+      - caddy-config:/config
+    environment:
+      - TZ=Asia/Shanghai
+    restart: unless-stopped
+
+volumes:
+  kms-data:
+  caddy-data:
+  caddy-config:

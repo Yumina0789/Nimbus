@@ -594,7 +594,7 @@ async function loadSummary(){
       missing ? "未检测到服务" : (s.running ? "运行中" : "已停止");
     document.getElementById("svcStateV").className = "v " + (missing ? "warn-v" : (s.running ? "ok-v" : "bad-v"));
     const unitEl = document.getElementById("svcUnitV");
-    if(unitEl) unitEl.textContent = (missing ? "未检测到 " : "systemd · ") + (s.unit || "vlmcsd");
+    if(unitEl) unitEl.textContent = (missing ? "未检测到 " : ((s.manager || "systemd") + " · ")) + (s.unit || "vlmcsd");
     document.getElementById("svcPidV").textContent = s.pid ?? "–";
     document.getElementById("svcBinV").textContent = s.binary || "–";
     document.getElementById("svcSinceV").textContent = s.since || "–";
