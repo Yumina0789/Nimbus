@@ -5,6 +5,16 @@
 #
 # KMS 本身（kms.lolicon.fans:1688）是裸 TCP，不经过 Caddy —— HTTP 反代处理不了
 # 它，客户端也不需要 HTTPS。
+#
+# 面板改这个文件：Nimbus 容器把同一份文件挂进去，界面上的「域名与 HTTPS」读写
+# 的就是它，保存后通过下面的 admin 端点热重载。
+
+{
+	# 面板（另一个容器）通过这个端点热重载配置。只在 compose 内网可达：
+	# 没有 publish 到宿主机，公网也碰不到。不想让面板能改配置就删掉这一行，
+	# 界面上会如实显示"没有自动重载通道"，保存只写文件。
+	admin 0.0.0.0:2019
+}
 
 adkms.lolicon.fans {
 	encode zstd gzip

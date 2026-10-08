@@ -25,9 +25,13 @@ services:
     volumes:
       - kms-data:/var/lib/nimbus        # SQLite 统计库 + token（容器重建也不丢）
       - /etc/vlmcsd:/etc/vlmcsd         # vlmcsd 的 ini 留在宿主上：运维看得见、改得动
+      - ./Caddyfile:/etc/caddy/Caddyfile # 面板上的「域名与 HTTPS」读写的就是这份文件
+      - caddy-data:/caddy-data:ro        # 只读：面板据此显示证书主体与到期时间
     environment:
       - TZ=Asia/Shanghai
       - VLMCSD_INI=/etc/vlmcsd/vlmcsd.ini
+      # 只用来在界面上生成 DNS 记录 / KMS 客户端命令，不参与反代
+      - NIMBUS_KMS_HOST=${NIMBUS_KMS_HOST:-kms.example.com}
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8099/api/meta',timeout=5)"]

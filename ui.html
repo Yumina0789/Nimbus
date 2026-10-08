@@ -389,36 +389,57 @@
 
   <!-- 域名与 HTTPS -->
   <section id="tab-domain" class="hidden">
+    <div class="grid g4" style="margin-bottom:var(--gap)">
+      <div class="stat glass"><div class="k"><svg class="ico"><use href="#i-file"/></svg>Caddyfile</div>
+        <div class="v" style="font-size:13px;font-weight:500" id="dmFileV">–</div>
+        <div class="n" id="dmFileN">–</div></div>
+      <div class="stat glass"><div class="k"><svg class="ico"><use href="#i-globe"/></svg>当前域名</div>
+        <div class="v" style="font-size:16px" id="dmDomainV">–</div>
+        <div class="n" id="dmDomainN">–</div></div>
+      <div class="stat glass"><div class="k"><svg class="ico"><use href="#i-shield"/></svg>HTTPS 证书</div>
+        <div class="v" id="dmCertV">–</div>
+        <div class="n" id="dmCertN">–</div></div>
+      <div class="stat glass"><div class="k"><svg class="ico"><use href="#i-restart"/></svg>生效方式</div>
+        <div class="v" style="font-size:16px" id="dmReloadV">–</div>
+        <div class="n" id="dmReloadN">–</div></div>
+    </div>
+
     <div class="panel glass">
-      <h2><svg class="ico"><use href="#i-globe"/></svg>域名与证书
-        <span class="q">DNS 记录在域名服务商处添加，Caddy 自动申请并续期证书</span></h2>
+      <h2><svg class="ico"><use href="#i-globe"/></svg>绑定域名
+        <span class="q">下面填的就是线上 Caddyfile 里的实际内容，改完保存会立刻热重载</span></h2>
       <div class="grid g3">
         <div class="field"><label>管理界面域名</label>
-          <input id="dmName" placeholder="kms-admin.example.com"></div>
+          <input id="dmName" placeholder="panel.example.com"></div>
         <div class="field"><label>Let's Encrypt 邮箱</label>
-          <input id="dmMail" placeholder="you@example.com"><div class="hint">可留空</div></div>
+          <input id="dmMail" placeholder="you@example.com">
+          <div class="hint">留空就用 Caddy 的默认账户，不影响签发</div></div>
         <div class="field" style="align-self:start">
           <div class="row" style="margin-top:22px">
-            <button class="act" onclick="checkDomain()">
+            <button class="act" id="dmSave" onclick="saveDomain()">
+              <svg class="ico"><use href="#i-check"/></svg>保存并重载</button>
+            <button class="act ghost" onclick="loadDomain()">
+              <svg class="ico"><use href="#i-restart"/></svg>重新读取</button>
+            <button class="act ghost" onclick="checkDomain()">
               <svg class="ico"><use href="#i-search"/></svg>检查解析</button>
-            <button class="act ghost" onclick="loadCaddy()">
-              <svg class="ico"><use href="#i-shield"/></svg>生成配置</button>
           </div>
+          <div class="hint" id="dmState" style="margin-top:8px"></div>
         </div>
       </div>
       <div id="dmResult" class="grid g2" style="margin-top:6px"></div>
     </div>
 
-    <div class="panel glass hidden" id="dnsPanel">
-      <h2><svg class="ico"><use href="#i-network"/></svg>DNS 记录</h2>
+    <div class="panel glass">
+      <h2><svg class="ico"><use href="#i-network"/></svg>DNS 记录
+        <span class="q">在域名服务商处添加；面板已经帮你查了当前的解析结果</span></h2>
       <div class="scroll"><table>
         <thead><tr><th>类型</th><th>名称</th><th>值</th><th>作用</th></tr></thead>
         <tbody id="dnsBody"></tbody></table></div>
       <div class="hint" id="dmNotes" style="margin-top:12px"></div>
     </div>
 
-    <details id="caddyPanel" class="hidden">
-      <summary><svg class="ico"><use href="#i-shield"/></svg>Caddyfile</summary>
+    <details class="panel glass" id="caddyPanel">
+      <summary><svg class="ico"><use href="#i-file"/></svg>线上 Caddyfile 原文
+        <span class="hint" style="font-weight:400">（保存后被面板改写的就是这份文件）</span></summary>
       <pre id="caddyBox" style="margin-top:12px"></pre>
     </details>
   </section>
@@ -719,6 +740,8 @@ async function loadLogs(){
 }
 
 /* --- 域名与 HTTPS ------------------------------------------------------ */
+const RELOAD_LABEL = {admin:"Caddy admin API 热重载", caddy:"caddy reload",
+                      systemctl:"systemctl reload caddy", manual:"没有自动通道"};
 function resultCard(icon, title, valueHtml, note, ok){
   return `<div class="stat glass"><div class="k"><svg class="ico"><use href="#i-${icon}"/></svg>${title}
             ${ok === undefined ? "" : `<span class="tag ${ok ? "ok" : "bad"}" style="margin-left:auto">
@@ -726,6 +749,91 @@ function resultCard(icon, title, valueHtml, note, ok){
             </div>
             <div class="v" style="font-size:14px;font-weight:500">${valueHtml}</div>
             <div class="n">${note}</div></div>`;
+}
+async function loadDomain(){
+  const state = document.getElementById("dmState");
+  state.textContent = "读取中…";
+  try{
+    const j = await api("/api/domain");
+    document.getElementById("dmName").value = j.host || "";
+    document.getElementById("dmMail").value = j.email || "";
+
+    document.getElementById("dmFileV").textContent = j.caddyfile || "没有接 Caddy";
+    document.getElementById("dmFileN").textContent = !j.configured
+      ? "真机模式请加 --caddyfile /etc/caddy/Caddyfile"
+      : (!j.readable ? "文件还不存在，保存时会新建"
+                     : (j.writable ? "可读可写 · " + j.blocks + " 个站点块"
+                                   : "只读：容器里没挂进来，面板改不了"));
+
+    document.getElementById("dmDomainV").textContent = j.host || "未配置";
+    document.getElementById("dmDomainN").textContent =
+      "反代 " + (j.upstream || "–") + (j.has_global ? " · 有全局选项块" : "");
+
+    const c = j.cert || {};
+    const cv = document.getElementById("dmCertV");
+    if(c.not_after){
+      cv.textContent = (c.days_left ?? "?") + " 天后到期";
+      cv.className = "v " + (c.days_left == null ? "" : c.days_left < 0 ? "bad-v"
+                            : c.days_left < 14 ? "warn-v" : "ok-v");
+      document.getElementById("dmCertN").textContent =
+        (c.trusted === false ? "校验未通过 · " : "") + (c.issuer || "") +
+        (c.source === "caddy-storage" ? " · 读自证书文件" : " · 实握手取得");
+    }else{
+      cv.textContent = "还没拿到";
+      cv.className = "v";
+      document.getElementById("dmCertN").textContent =
+        c.error || "DNS 生效 + 80 端口可达之后，Caddy 才会签发";
+    }
+
+    document.getElementById("dmReloadV").textContent =
+      RELOAD_LABEL[(j.reload || {}).method] || "–";
+    document.getElementById("dmReloadN").textContent = (j.reload || {}).available
+      ? "保存后自动生效，不用手工操作"
+      : "保存只写文件，需要你手工让 Caddy 重新加载";
+
+    document.getElementById("caddyBox").textContent = j.text || "(空)";
+    document.getElementById("dnsBody").innerHTML = (j.dns_records || []).map(r =>
+      `<tr><td><span class="tag info">${esc(r.type)}</span></td><td class="mono">${esc(r.name)}</td>
+           <td class="mono">${esc(r.value)}</td><td class="hint">${esc(r.why)}</td></tr>`).join("");
+
+    const a = j.a || {};
+    document.getElementById("dmNotes").innerHTML =
+      (a.ok && a.values && a.values.length
+        ? "当前解析：<b class='mono'>" + a.values.map(esc).join("、") + "</b><br>" : "")
+      + (j.notes || []).map(n => "· " + esc(n)).join("<br>");
+
+    document.getElementById("dmSave").disabled = !(j.configured && j.writable);
+    state.innerHTML = j.configured
+      ? (j.writable ? "" : '<span class="warn-v">这个文件面板没有写权限</span>')
+      : '<span class="warn-v">这个后端没有接 Caddy，只能看示例</span>';
+  }catch(e){
+    state.innerHTML = '<span class="warn-v">读取失败</span>';
+  }
+}
+async function saveDomain(){
+  const domain = document.getElementById("dmName").value.trim();
+  const email = document.getElementById("dmMail").value.trim();
+  if(!domain) return toast("请先填写域名", true);
+  const btn = document.getElementById("dmSave");
+  btn.disabled = true;
+  document.getElementById("dmState").textContent = "保存中…";
+  try{
+    const j = await api("/api/domain", {method:"POST", body: JSON.stringify({domain, email})});
+    if(j.ok){
+      toast(esc(j.message || "已保存，Caddy 已重载"));
+      if(j.warning) setTimeout(() => toast(esc(j.warning), true), 200);
+      await loadDomain();
+    }else{
+      document.getElementById("dmState").innerHTML =
+        '<span class="warn-v">没保存成功</span>';
+      toast((j.errors || ["保存失败"]).map(esc).join("<br>"), true);
+      btn.disabled = false;
+    }
+  }catch(e){
+    document.getElementById("dmState").innerHTML = '<span class="warn-v">保存失败</span>';
+    toast("保存失败：" + esc(e.message), true);
+    btn.disabled = false;
+  }
 }
 async function checkDomain(){
   const domain = document.getElementById("dmName").value.trim();
@@ -744,19 +852,6 @@ async function checkDomain(){
                s.ok ? "客户端可据此自动发现 KMS 主机" : esc(s.error || ""),
                s.ok ? s.values.length > 0 : undefined);
   toast(a.ok ? "DNS 检查完成" : "DNS 检查完成，存在问题", !a.ok);
-}
-async function loadCaddy(){
-  const domain = document.getElementById("dmName").value.trim() || "kms-admin.example.com";
-  const email = document.getElementById("dmMail").value.trim();
-  const j = await api(`/api/domain/caddy?domain=${encodeURIComponent(domain)}&email=${encodeURIComponent(email)}`);
-  document.getElementById("caddyBox").textContent = j.caddyfile;
-  document.getElementById("dnsBody").innerHTML = j.dns_records.map(r =>
-    `<tr><td><span class="tag info">${esc(r.type)}</span></td><td class="mono">${esc(r.name)}</td>
-         <td class="mono">${esc(r.value)}</td><td class="hint">${esc(r.why)}</td></tr>`).join("");
-  document.getElementById("dmNotes").innerHTML = j.notes.map(n => "· " + esc(n)).join("<br>");
-  document.getElementById("dnsPanel").classList.remove("hidden");
-  document.getElementById("caddyPanel").classList.remove("hidden");
-  toast("配置与 DNS 记录已生成");
 }
 
 /* --- 激活统计 ---------------------------------------------------------- */
@@ -818,6 +913,7 @@ document.querySelectorAll("nav button").forEach(b => b.onclick = () => {
   for(const id of ["overview","config","service","domain","stats"])
     document.getElementById("tab-" + id).classList.toggle("hidden", id !== b.dataset.tab);
   if(b.dataset.tab === "stats") loadStats(stPage);
+  if(b.dataset.tab === "domain") loadDomain();
 });
 
 /* --- 入口 ------------------------------------------------------------- */

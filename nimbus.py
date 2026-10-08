@@ -44,17 +44,21 @@ import secrets
 import shutil
 import socket
 import sqlite3
+import ssl
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 HERE = Path(__file__).resolve().parent
 
 # --------------------------------------------------------------------------
@@ -962,35 +966,394 @@ def _parse_srv(data):
         return []
 
 
-def caddy_config(domain, backend_host="127.0.0.1", backend_port=8099, email=""):
-    return {
-        "caddyfile": (
-            f"# 保存到 /etc/caddy/Caddyfile\n"
-            f"{domain} {{\n"
-            + (f"    tls {email}\n" if email else "")
-            + f"    reverse_proxy {backend_host}:{backend_port}\n"
-            f"    encode zstd gzip\n"
-            f"    header {{\n"
-            f"        Strict-Transport-Security \"max-age=31536000; includeSubDomains\"\n"
-            f"        X-Content-Type-Options nosniff\n"
-            f"        X-Frame-Options DENY\n"
-            f"    }}\n"
-            f"    log {{\n        output file /var/log/caddy/{domain}.log\n    }}\n"
-            f"}}\n"
-        ),
-        "dns_records": [
-            {"type": "A", "name": domain, "value": "<这台服务器的公网 IP>", "why": "让浏览器能解析到管理界面"},
-            {"type": "A", "name": f"kms.{domain}", "value": "<这台服务器的公网 IP>", "why": "KMS 客户端要连的地址（可选，也可以直接用 IP）"},
-            {"type": "SRV", "name": f"_vlmcs._tcp.{domain}", "value": "0 0 1688 kms." + domain,
-             "why": "vlmcs 诊断客户端靠这条记录自动发现 KMS 主机"},
-        ],
-        "notes": [
-            "80/443 必须能从公网访问，Caddy 才能签发 Let's Encrypt 证书。",
-            "管理界面本机监听 127.0.0.1:8099 即可，公网只开 Caddy 的 443。",
-            "装 Caddy 的两行：apt install -y caddy  然后  systemctl reload caddy",
-            "DNS 改动生效需要时间（TTL），界面里的“检查”按钮可以反复点。",
-        ],
+# --------------------------------------------------------------------------
+# Caddy：把线上真实的配置读出来、按修改写回去、让它立刻生效
+# --------------------------------------------------------------------------
+def _flat_name(field):
+    return ", ".join("%s=%s" % (k, v) for part in (field or ()) for k, v in part)
+
+
+def _parse_cert_time(s):
+    """证书时间是 "Oct  8 17:31:46 2026 GMT" 这种格式。"""
+    s = " ".join((s or "").split())
+    for fmt in ("%b %d %H:%M:%S %Y %Z", "%b %d %H:%M:%S %Y"):
+        try:
+            return datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    return None
+
+
+def _cert_fields(decoded):
+    out = {
+        "subject": _flat_name(decoded.get("subject")),
+        "issuer": _flat_name(decoded.get("issuer")),
+        "not_before": decoded.get("notBefore") or "",
+        "not_after": decoded.get("notAfter") or "",
+        "sans": [v for k, v in decoded.get("subjectAltName", ()) if k == "DNS"],
     }
+    t = _parse_cert_time(out["not_after"])
+    out["days_left"] = int((t - datetime.now(timezone.utc)).total_seconds() // 86400) if t else None
+    return out
+
+
+class CaddyManager:
+    """面板上的「域名与 HTTPS」。
+
+    只做三件事：把线上真实的 Caddyfile 读出来给你看、按你的改动定向写回去、让
+    Caddy 立刻生效。容器部署里 Caddy 是另一个容器，所以重载走它的 admin API
+    （只开在 compose 内网，没有发布到宿主机）；裸机部署退到 caddy reload /
+    systemctl reload caddy。
+    """
+
+    def __init__(self, caddyfile="", admin="", cert_dir="", upstream="", kms_host=""):
+        self.caddyfile = Path(caddyfile) if caddyfile else None
+        self.admin = (admin or "").rstrip("/")
+        self.cert_dir = Path(cert_dir) if cert_dir else None
+        self.upstream = upstream or "127.0.0.1:8099"
+        self.kms_host = kms_host
+
+    # --- 文件 -------------------------------------------------------------
+    def configured(self):
+        return self.caddyfile is not None
+
+    def readable(self):
+        try:
+            return bool(self.caddyfile and self.caddyfile.is_file())
+        except OSError:
+            return False
+
+    def writable(self):
+        if not self.caddyfile:
+            return False
+        node = self.caddyfile if self.caddyfile.exists() else self.caddyfile.parent
+        try:
+            return os.access(node, os.W_OK)
+        except OSError:
+            return False
+
+    def read(self):
+        if not self.readable():
+            return ""
+        return self.caddyfile.read_text(encoding="utf-8", errors="replace")
+
+    # --- 解析（轻量实现：只认顶层站点块的地址 / reverse_proxy / tls）------
+    @staticmethod
+    def _strip_comment(line):
+        i = line.find("#")
+        return line[:i] if i >= 0 else line
+
+    def parse(self, text):
+        info = {"domains": [], "email": "", "upstream": "", "blocks": [], "has_global": False}
+        kind, header, body, depth, head_i = None, "", [], 0, 0
+        for i, raw in enumerate(text.splitlines()):
+            line = self._strip_comment(raw).strip()
+            if kind is None:
+                if line == "{":
+                    kind, header, body, depth, head_i = "global", "", [], 1, i
+                    info["has_global"] = True
+                elif line.endswith("{"):
+                    kind, header, body, depth, head_i = "site", line[:-1].strip(), [], 1, i
+                continue
+            if line == "}":
+                depth -= 1
+                if depth > 0:
+                    body.append(line)
+                    continue
+                if kind == "site":
+                    blk = {"addr": header, "head": head_i, "close": i, "upstream": "", "tls": ""}
+                    for b in body:
+                        s = b.strip()
+                        if s.startswith("reverse_proxy") and not blk["upstream"]:
+                            blk["upstream"] = s[len("reverse_proxy"):].strip()
+                        elif s.startswith("tls") and not blk["tls"]:
+                            blk["tls"] = s[3:].strip()
+                    info["blocks"].append(blk)
+                    info["domains"] += [a.strip() for a in header.split(",") if a.strip()]
+                else:
+                    for b in body:
+                        s = b.strip()
+                        if s.startswith("email"):
+                            info["email"] = s[5:].strip()
+                            break
+                kind, header, body, depth = None, "", [], 0
+                continue
+            if line.endswith("{"):
+                depth += 1
+            body.append(line)
+        if info["blocks"]:
+            info["upstream"] = info["blocks"][0]["upstream"]
+        return info
+
+    def block(self, domain, email="", upstream=""):
+        """新站点块模板：只有整个 Caddyfile 里一个站点块都没有时才用它。"""
+        return (f"{domain} {{\n"
+                + (f"\ttls {email}\n" if email else "")
+                + f"\treverse_proxy {upstream or self.upstream}\n"
+                "\tencode zstd gzip\n"
+                "\theader {\n"
+                "\t\tStrict-Transport-Security \"max-age=31536000; includeSubDomains\"\n"
+                "\t\tX-Content-Type-Options \"nosniff\"\n"
+                "\t\tX-Frame-Options \"DENY\"\n"
+                "\t\tReferrer-Policy \"no-referrer\"\n"
+                "\t\t-Server\n"
+                "\t}\n"
+                "\tlog {\n"
+                f"\t\toutput file /data/access.log\n"
+                "\t\tformat console\n"
+                "\t}\n"
+                "}\n")
+
+    def apply(self, domain, email):
+        """定向改：只换站点地址和 tls 邮箱，块里其他指令（反代目标等）一律保留。
+
+        返回 (新文本, 错误列表)。
+        """
+        domain = (domain or "").strip().lower()
+        email = (email or "").strip()
+        if not re.match(r"^(?!-)[a-z0-9-]{1,63}(?<!-)(\.(?!-)[a-z0-9-]{1,63}(?<!-))+$", domain):
+            return None, ["域名不合法：%s（要写成 panel.example.com 这种）" % (domain or "(空)")]
+        if email and not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email):
+            return None, ["邮箱不合法：%s" % email]
+
+        old = self.read()
+        info = self.parse(old)
+        if len(info["blocks"]) > 1:
+            return None, ["%s 里有 %d 个站点块，面板不替你猜该改哪一个，请直接编辑该文件"
+                          % (self.caddyfile, len(info["blocks"]))]
+        if not info["blocks"]:
+            text = (old.rstrip() + "\n\n" if old.strip() else "") + self.block(domain, email)
+            return text, []
+
+        blk = info["blocks"][0]
+        lines = old.splitlines()
+        lines[blk["head"]] = "%s {" % domain
+
+        # 缩进跟着原有风格走（别把 tab 风格的文件混成空格）
+        indent = "\t"
+        for j in range(blk["head"] + 1, blk["close"]):
+            if lines[j].strip():
+                indent = re.match(r"\s*", lines[j]).group(0) or "\t"
+                break
+
+        tls_i = None
+        for j in range(blk["head"] + 1, blk["close"]):
+            if self._strip_comment(lines[j]).strip().startswith("tls"):
+                tls_i = j
+                break
+
+        if email and tls_i is not None:
+            lines[tls_i] = "%stls %s" % (indent, email)
+        elif email:
+            k = blk["head"] + 1
+            while k < blk["close"] and not lines[k].strip():
+                k += 1
+            lines.insert(k, "%stls %s" % (indent, email))
+        elif tls_i is not None and "@" in blk["tls"]:
+            # 原来写的是邮箱才删；tls internal 之类的自定义指令不动
+            del lines[tls_i]
+
+        return "\n".join(lines).rstrip() + "\n", []
+
+    def write(self, text):
+        """就地覆写，不做 rename。
+
+        文件很可能是从宿主机 bind mount 进来的**单文件**挂载点，往挂载点上
+        rename 会被内核拒掉（EBUSY），所以必须原地写。
+        """
+        try:
+            self.caddyfile.parent.mkdir(parents=True, exist_ok=True)
+            if self.caddyfile.exists():
+                shutil.copy2(str(self.caddyfile), str(self.caddyfile) + ".bak")
+            with open(self.caddyfile, "w", encoding="utf-8") as fh:
+                fh.write(text)
+                fh.flush()
+                os.fsync(fh.fileno())
+            return True, ""
+        except OSError as e:
+            return False, "写 %s 失败：%s" % (self.caddyfile, e)
+
+    # --- 重载 -------------------------------------------------------------
+    def reload_method(self):
+        if self.admin:
+            return "admin"
+        if shutil.which("caddy"):
+            return "caddy"
+        try:
+            r = subprocess.run(["systemctl", "cat", "caddy"], capture_output=True, text=True, timeout=8)
+            if r.returncode == 0:
+                return "systemctl"
+        except (OSError, subprocess.SubprocessError):
+            pass
+        return "manual"
+
+    def reload(self, text):
+        """把新配置交给 Caddy。返回 (是否成功, 错误, 说明)。"""
+        method = self.reload_method()
+        if method == "admin":
+            req = urllib.request.Request(
+                self.admin + "/load", data=text.encode("utf-8"), method="POST",
+                headers={"Content-Type": "text/caddyfile", "Cache-Control": "must-revalidate"})
+            try:
+                # admin 在容器内网，必须绕开环境里的 HTTP(S)_PROXY，否则会被代到别处去
+                opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+                with opener.open(req, timeout=20) as r:
+                    return True, "", "已通过 Caddy admin API 热重载（HTTP %d）" % r.status
+            except urllib.error.HTTPError as e:
+                detail = e.read().decode("utf-8", "replace").strip()
+                return False, "Caddy 拒绝了这份配置（HTTP %d）：%s" % (e.code, detail[:400]), ""
+            except Exception as e:  # noqa: BLE001
+                return False, "连不上 Caddy admin（%s）：%s" % (self.admin, e), ""
+        if method == "caddy":
+            try:
+                r = subprocess.run(["caddy", "reload", "--config", str(self.caddyfile),
+                                    "--adapter", "caddyfile"], capture_output=True, text=True, timeout=30)
+            except (OSError, subprocess.SubprocessError) as e:
+                return False, "caddy reload 失败：%s" % e, ""
+            return r.returncode == 0, (r.stderr or "").strip()[:400], "已用 caddy reload 重载"
+        if method == "systemctl":
+            try:
+                r = subprocess.run(["systemctl", "reload", "caddy"], capture_output=True, text=True, timeout=30)
+            except (OSError, subprocess.SubprocessError) as e:
+                return False, "systemctl reload caddy 失败：%s" % e, ""
+            return r.returncode == 0, (r.stderr or "").strip()[:400], "已用 systemctl reload caddy 重载"
+        return False, "", ("配置已写入 %s，但这个环境没有可用的重载通道，"
+                           "请手工执行：caddy reload --config %s" % (self.caddyfile, self.caddyfile))
+
+    def save(self, domain, email):
+        # 先校验输入，再谈环境：不然在 demo 模式下填错域名，看到的会是"没接 Caddy"
+        text, errors = self.apply(domain, email)
+        if errors:
+            return {"ok": False, "errors": errors}
+        if not self.configured():
+            return {"ok": False, "errors": ["这个后端没有接 Caddy（真机模式请加 --caddyfile /etc/caddy/Caddyfile）"]}
+        if not self.writable():
+            return {"ok": False, "errors": [
+                "%s 不可写：容器里要把它挂进来（compose 的 volumes），或者让面板以有写权限的用户运行"
+                % self.caddyfile]}
+        ok, err = self.write(text)
+        if not ok:
+            return {"ok": False, "errors": [err]}
+        reloaded, rerr, rmsg = self.reload(text)
+        out = {"ok": True, "reloaded": reloaded, "message": rmsg,
+               "domain": domain, "email": email, "text": text}
+        if rerr:
+            out["warning"] = rerr
+        return out
+
+    # --- 证书 -------------------------------------------------------------
+    @staticmethod
+    def _decode_cert(path):
+        try:
+            return ssl._ssl._test_decode_cert(str(path))  # noqa: SLF001
+        except Exception:  # noqa: BLE001
+            return None
+
+    def cert_info(self, host):
+        info = {"domain": host, "source": "", "trusted": None, "error": "", "path": "",
+                "subject": "", "issuer": "", "not_before": "", "not_after": "",
+                "sans": [], "days_left": None}
+        if host and self.cert_dir and self.cert_dir.exists():
+            try:
+                cands = sorted(self.cert_dir.glob("*/*/*.crt"),
+                               key=lambda p: p.stat().st_mtime, reverse=True)
+            except OSError:
+                cands = []
+            for p in cands:
+                if p.parent.name != host:
+                    continue
+                d = self._decode_cert(p)
+                if d:
+                    info.update(_cert_fields(d))
+                    info.update({"source": "caddy-storage", "path": str(p), "trusted": True})
+                    return info
+        if not host:
+            return info
+        try:
+            ctx = ssl.create_default_context()
+            with socket.create_connection((host, 443), timeout=8) as sock:
+                with ctx.wrap_socket(sock, server_hostname=host) as ss:
+                    info.update(_cert_fields(ss.getpeercert() or {}))
+                    info.update({"source": "live", "trusted": True})
+                    return info
+        except ssl.SSLCertVerificationError as e:
+            info["trusted"] = False
+            info["error"] = "证书校验没过：" + (getattr(e, "verify_message", "") or str(e))
+        except Exception as e:  # noqa: BLE001
+            info["error"] = "%s: %s" % (type(e).__name__, e)
+        # 握手失败也尽量把证书细节取出来给用户看
+        try:
+            pem = ssl.get_server_certificate((host, 443), timeout=8)
+            tmp = Path(tempfile.gettempdir()) / ("nimbus-%s.crt" % host)
+            tmp.write_text(pem, encoding="ascii")
+            d = self._decode_cert(tmp)
+            if d:
+                info.update(_cert_fields(d))
+                info["source"] = "live-unverified"
+        except Exception:  # noqa: BLE001
+            pass
+        return info
+
+    # --- 汇总给界面 --------------------------------------------------------
+    def status(self):
+        text = self.read()
+        info = self.parse(text)
+        raw_addr = info["domains"][0] if info["domains"] else ""
+        host = re.sub(r"^[a-z][a-z0-9+.-]*://", "", raw_addr).split(":")[0].strip().lower()
+        if not re.match(r"^[a-z0-9.\-]+$", host):
+            host = ""
+        method = self.reload_method() if self.configured() else "manual"
+        a = check_a(host) if host else {"ok": False, "values": [], "error": "还没有配置域名"}
+        # 没配域名时用占位符生成示例，别让 DNS 表里出现空名字
+        shown_host = host or "panel.example.com"
+        shown = text or ("# 当前后端没有接真实的 Caddyfile，下面是按默认值生成的示例\n"
+                         + self.block(shown_host, info["email"]))
+        return {
+            "configured": self.configured(),
+            "caddyfile": str(self.caddyfile or ""),
+            "readable": self.readable(),
+            "writable": self.writable(),
+            "domain": raw_addr, "host": host,
+            "email": info["email"],
+            "upstream": info["upstream"] or self.upstream,
+            "blocks": len(info["blocks"]),
+            "has_global": info["has_global"],
+            "text": shown,
+            "reload": {"method": method, "target": self.admin,
+                       "available": method in ("admin", "caddy", "systemctl")},
+            "cert": self.cert_info(host),
+            "a": a,
+            "dns_records": caddy_dns_records(shown_host, a.get("values"), self.kms_host),
+            "notes": caddy_notes(method),
+        }
+
+
+def caddy_dns_records(domain, ips=None, kms_host=""):
+    value = "、".join(ips) if ips else "<这台服务器的公网 IP>"
+    rows = [{"type": "A", "name": domain, "value": value,
+             "why": "浏览器用这个域名访问面板，Caddy 也按它签发证书"}]
+    if kms_host:
+        rows.append({"type": "A", "name": kms_host.split(":")[0], "value": value,
+                     "why": "KMS 客户端连的地址（裸 TCP 1688，不经过 Caddy）"})
+    rows.append({"type": "SRV", "name": "_vlmcs._tcp." + domain,
+                 "value": "0 0 1688 " + (kms_host.split(":")[0] if kms_host else domain),
+                 "why": "可选的自动发现记录，vlmcs 诊断客户端用得上"})
+    return rows
+
+
+def caddy_notes(method):
+    notes = ["80 和 443 必须能从公网访问，Caddy 才能签发 / 续期 Let's Encrypt 证书。",
+             "改域名后要先让 DNS 解析到这台机器，证书签发通常几秒到几十秒。"]
+    if method == "admin":
+        notes.append("保存走 Caddy 的 admin API 热重载：正在处理的连接不会断。")
+        notes.append("admin 端点只开在容器内网（compose 网络），没有发布到宿主机。")
+    elif method == "caddy":
+        notes.append("保存后自动执行 caddy reload --config <Caddyfile>。")
+    elif method == "systemctl":
+        notes.append("保存后自动执行 systemctl reload caddy。")
+    else:
+        notes.append("这个环境没有自动重载通道：保存只写文件，还要你手工让 Caddy 重新加载。")
+    return notes
 
 
 # --------------------------------------------------------------------------
@@ -1066,10 +1429,8 @@ class Handler(BaseHTTPRequestHandler):
                     "top_fails": st.top("reason"),
                     "summary": st.summary(),
                 })
-            if u.path == "/api/domain/caddy":
-                return self._send(200, caddy_config(q.get("domain", [""])[0] or "kms.example.com",
-                                                    backend_port=self.app["port"],
-                                                    email=q.get("email", [""])[0]))
+            if u.path == "/api/domain":
+                return self._send(200, self.app["caddy"].status())
         except Exception as e:  # noqa: BLE001
             return self._send(500, {"error": str(e)})
         return self._send(404, {"error": "not found"})
@@ -1093,6 +1454,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, b.rollback())
             if u.path == "/api/service":
                 return self._send(200, b.service(body.get("action", "")))
+            if u.path == "/api/domain":
+                return self._send(200, self.app["caddy"].save(body.get("domain", ""),
+                                                              body.get("email", "")))
             if u.path == "/api/domain/check":
                 domain = (body.get("domain") or "").strip()
                 if not domain:
@@ -1126,6 +1490,16 @@ def main():
                     help="容器部署：用 supervisord 而不是 systemd 管理 vlmcsd")
     ap.add_argument("--log-file", default="",
                     help="配合 --supervisor：vlmcsd 的日志文件（默认 /var/log/vlmcsd.log）")
+    ap.add_argument("--caddyfile", default="",
+                    help="Caddy 的 Caddyfile 路径；给了它，界面上的「域名与 HTTPS」才能读改真实配置")
+    ap.add_argument("--caddy-admin", default="",
+                    help="Caddy admin API 地址，容器部署填 http://caddy:2019，用它做热重载")
+    ap.add_argument("--caddy-cert-dir", default="",
+                    help="Caddy 证书存储目录（只读挂进来，界面就能显示证书主体与到期时间）")
+    ap.add_argument("--caddy-upstream", default="",
+                    help="新建站点块时反代到哪里（默认 127.0.0.1:8099，容器里是 kms:8099）")
+    ap.add_argument("--kms-host", default=os.environ.get("NIMBUS_KMS_HOST", ""),
+                    help="KMS 客户端用的域名（只在界面里生成 DNS 记录时用，不参与反代）")
     args = ap.parse_args()
 
     data_dir = Path(args.data_dir).expanduser() if args.data_dir else HERE
@@ -1158,7 +1532,9 @@ def main():
                 pass
 
     app = {"store": store, "backend": backend, "token": token, "mode": args.mode,
-           "port": args.port, "started": now_iso()}
+           "port": args.port, "started": now_iso(),
+           "caddy": CaddyManager(args.caddyfile, args.caddy_admin, args.caddy_cert_dir,
+                                 args.caddy_upstream, args.kms_host)}
     Handler.app = app
 
     # 后台配额巡检：10 分钟一次，内存不动
@@ -1184,6 +1560,10 @@ def main():
         print(f"  配置文件：{args.ini}")
         if args.supervisor:
             print(f"  日志文件：{args.log_file or '/var/log/vlmcsd.log'}")
+    if app["caddy"].configured():
+        print(f"  Caddyfile：{app['caddy'].caddyfile}"
+              f"（{'可写' if app['caddy'].writable() else '只读'}）"
+              f"  重载通道：{app['caddy'].reload_method()}")
     print("=" * 72)
     sys.stdout.flush()
     try:

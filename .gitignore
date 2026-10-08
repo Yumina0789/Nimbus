@@ -2,3 +2,6 @@ nimbus.db*
 nimbus.token
 __pycache__/
 *.pyc
+# 部署相关的取值（KMS 域名等）写在 docker/.env 里，不进仓库
+docker/.env
+*.bak
