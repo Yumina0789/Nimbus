@@ -217,6 +217,15 @@ class StatsStore:
                 self.db.execute("PRAGMA incremental_vacuum")
         return removed
 
+    def clear(self):
+        """清空全部激活记录（表结构与配额设置保留），顺手把磁盘空间还回去。"""
+        with self.lock:
+            removed = self.db.execute("DELETE FROM events").rowcount
+            self.db.commit()
+            self.db.execute("PRAGMA incremental_vacuum")
+            self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        return removed
+
     def summary(self):
         day_start = int(datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
         with self.lock:
@@ -261,8 +270,8 @@ class StatsStore:
         start = int((datetime.now() - timedelta(days=days)).timestamp())
         where, args = ["ts >= ?"], [start]
         if q:
-            where.append("(ip LIKE ? OR version LIKE ?)")
-            args += [f"%{q}%", f"%{q}%"]
+            where.append("(ip LIKE ? OR product LIKE ? OR version LIKE ?)")
+            args += [f"%{q}%", f"%{q}%", f"%{q}%"]
         if result == "ok":
             where.append("ok = 1")
         elif result == "fail":
@@ -479,6 +488,7 @@ class LinuxBackend:
         self.previous = None
         self._ini_extra = []
         self._bin_cache = {}
+        self._block = []          # 正在累计的那次连接日志块
         self._tail_thread = None
         self.available = self._detect_service()
         threading.Thread(target=self._tail, daemon=True).start()
@@ -681,12 +691,90 @@ class LinuxBackend:
         return r.stdout.strip()
 
     # --- 日志 → 统计 ------------------------------------------------------
-    # vlmcsd 的日志行形如：
-    #   Connection from 10.0.0.5: ... <product>: success
-    # 具体格式要在真机上用真实日志校准；解析不出来的行直接忽略，不影响服务。
-    EVENT_RE = re.compile(r"Connection from (?P<ip>[\d.]+).*?(?P<product>[A-Za-z0-9 ().\-]{4,60}?):\s*(?P<verdict>success|rejected)", re.I)
+    # vlmcsd 的一次激活在日志里是一个块，形如：
+    #   IPv4 connection accepted: 10.0.0.5:52211.
+    #   <<< Incoming KMS request
+    #   Protocol version                : 6.0
+    #   Application ID                  : <guid> (Windows)
+    #   SKU ID (aka Activation ID)      : <guid> (Windows Server 2019 ARM64)
+    #   KMS ID (aka KMS counted ID)     : <guid> (Windows Server 2019)
+    #   Client machine ID               : <guid>
+    #   >>> Sending response, ePID source = randomized at program start
+    #   IPv4 connection closed: 10.0.0.5:52211.
+    # 所以按块累计、看到 closed 才落库。systemd（journalctl）与容器（日志文件）
+    # 两条链路共用这套解析，别再各写一份。
+    ACCEPT_RE = re.compile(r"IPv4 connection accepted: (?P<ip>[\d.]+):(?P<port>\d+)")
+    CLOSE_RE = re.compile(r"IPv4 connection closed: (?P<ip>[\d.]+):\d+")
+    # 三行产品信息，越往下越具体。界面要的是「哪个 Windows」，所以优先取 SKU：
+    #   Application ID : <guid> (Windows)                      ← 产品族
+    #   SKU ID         : <guid> (Windows Server 2019 ARM64)    ← 具体版本
+    #   KMS ID         : <guid> (Windows Server 2019)
+    PRODUCT_RE = re.compile(r"Application ID\s*:\s*\S+\s*\((?P<product>[^)]+)\)")
+    SKU_RE = re.compile(r"SKU ID[^:]*:\s*\S+\s*\((?P<sku>[^)]+)\)")
+    KMSID_RE = re.compile(r"KMS ID[^:]*:\s*\S+\s*\((?P<kms>[^)]+)\)")
+    PROTO_RE = re.compile(r"Protocol version\s*:\s*(?P<ver>[\d.]+)")
+    SENT_RE = re.compile(r">>>\s*Sending response")
+    REJECT_RE = re.compile(r"(reject|not licensed|error|fail)", re.I)
+    # 只有 "accepted" + "closed"、中间没有任何请求体的连接，是端口探活（监控健康检查、
+    # 扫描器）。它不该被记成一次"失败的激活"，否则面板上的失败数全是噪声。
+    PAYLOAD_RE = re.compile(r"<<<|Application ID|Client machine ID|Sending response|"
+                            r"reject|not licensed|error|fail", re.I)
+
+    def _level_of(self, line: str) -> str:
+        if re.search(r"error|fail|reject", line, re.I):
+            return "warn"
+        if "success" in line.lower():
+            return "ok"
+        return "info"
+
+    @staticmethod
+    def _named(match):
+        """取括号里的名字；vlmcsd 认不出来时会写 (Unknown)，那种不算数。"""
+        if not match:
+            return ""
+        name = (match.group(1) or "").strip()
+        return "" if name.lower() == "unknown" else name
+
+    def _event_from_block(self, block):
+        """把一个连接块变成一条统计记录；不是一个完整块就返回 None。"""
+        m = self.ACCEPT_RE.search(block)
+        if not m:
+            return None
+        if not self.PAYLOAD_RE.search(block):
+            return None
+        ip = m.group("ip")
+        ok = bool(self.SENT_RE.search(block))
+        product = (self._named(self.SKU_RE.search(block))
+                   or self._named(self.KMSID_RE.search(block))
+                   or self._named(self.PRODUCT_RE.search(block)))
+        pv = self.PROTO_RE.search(block)
+        version = ("v%s" % pv.group("ver")) if pv else ""
+        reason = ""
+        if not ok:
+            bad = [ln for ln in block.splitlines() if self.REJECT_RE.search(ln)]
+            reason = (bad[0] if bad else block.strip().splitlines()[-1] if block.strip() else "")[:120]
+        return ip, product, version, ok, reason
+
+    def _feed(self, line):
+        """喂一行日志进来：accepted 开块，closed 收块入库。"""
+        if not line:
+            return
+        self.log_lines.append({"t": now_iso(), "level": self._level_of(line), "msg": line})
+        del self.log_lines[:-400]
+        if self.ACCEPT_RE.search(line):
+            self._block = [line]
+            return
+        if self._block:
+            self._block.append(line)
+            if self.CLOSE_RE.search(line):
+                ev = self._event_from_block("\n".join(self._block))
+                if ev:
+                    ip, product, version, ok, reason = ev
+                    self.store.add(int(time.time()), ip, product, version, ok, reason)
+                self._block = []
 
     def _tail(self):
+        """journalctl -f 跟着 systemd 单元读日志。"""
         while True:
             if not self.available and not self._detect_service():
                 time.sleep(10)  # 还没装 vlmcsd：安静等待，别刷屏
@@ -695,17 +783,8 @@ class LinuxBackend:
                 proc = subprocess.Popen(["journalctl", "-u", self.UNIT, "-f", "-n", "0", "-o", "cat"],
                                         stdout=subprocess.PIPE, text=True)
                 for line in proc.stdout:
-                    line = line.rstrip()
-                    m = self.EVENT_RE.search(line)
-                    if m:
-                        ok = m.group("verdict").lower() == "success"
-                        self.store.add(int(time.time()), m.group("ip"), m.group("product"),
-                                       "", ok, "" if ok else line[-80:])
-                    self.log_lines.append({"t": now_iso(),
-                                           "level": "warn" if re.search(r"reject|error", line, re.I) else "info",
-                                           "msg": line})
-                    del self.log_lines[:-400]
-            except Exception:
+                    self._feed(line.rstrip())
+            except Exception:  # noqa: BLE001
                 pass
             time.sleep(5)
 
@@ -828,13 +907,6 @@ class ContainerBackend(LinuxBackend):
         return None, f"supervisor 后端不支持的操作：{action}"
 
     # --- 日志：读文件而不是 journalctl -----------------------------------
-    def _level_of(self, line: str) -> str:
-        if re.search(r"error|fail|reject", line, re.I):
-            return "warn"
-        if "success" in line.lower():
-            return "ok"
-        return "info"
-
     def logs(self, lines=200):
         if not self.log_file.exists():
             return [{"t": "", "level": "warn", "msg": f"日志文件还不存在：{self.log_file}"}]
@@ -850,43 +922,8 @@ class ContainerBackend(LinuxBackend):
                 out.append({"t": "", "level": self._level_of(line), "msg": line})
         return out
 
-    # vlmcsd 的一次激活在日志里是一个块，形如：
-    #   IPv4 connection accepted: 10.0.0.5:52211.
-    #   <<< Incoming KMS request
-    #   Application ID                  : <guid> (Windows 10 Pro)
-    #   Client machine ID               : <guid>
-    #   >>> Sending response, ePID source = randomized at program start
-    #   IPv4 connection closed: 10.0.0.5:52211.
-    # 所以按块解析，而不是按单行正则。
-    ACCEPT_RE = re.compile(r"IPv4 connection accepted: (?P<ip>[\d.]+):(?P<port>\d+)")
-    CLOSE_RE = re.compile(r"IPv4 connection closed: (?P<ip>[\d.]+):\d+")
-    PRODUCT_RE = re.compile(r"Application ID\s*:\s*\S+\s*\((?P<product>[^)]+)\)")
-    SENT_RE = re.compile(r">>>\s*Sending response")
-    REJECT_RE = re.compile(r"(reject|not licensed|error|fail)", re.I)
-    # 只有 "accepted" + "closed"、中间没有任何请求体的连接，是端口探活（监控健康检查、
-    # 扫描器）。它不该被记成一次"失败的激活"，否则面板上的失败数全是噪声。
-    PAYLOAD_RE = re.compile(r"<<<|Application ID|Client machine ID|Sending response|"
-                            r"reject|not licensed|error|fail", re.I)
-
-    def _event_from_block(self, block):
-        """把一个连接块变成一条统计记录；不是一个完整块就返回 None。"""
-        m = self.ACCEPT_RE.search(block)
-        if not m:
-            return None
-        if not self.PAYLOAD_RE.search(block):
-            return None
-        ip = m.group("ip")
-        ok = bool(self.SENT_RE.search(block))
-        p = self.PRODUCT_RE.search(block)
-        product = p.group("product") if p else ""
-        reason = ""
-        if not ok:
-            bad = [ln for ln in block.splitlines() if self.REJECT_RE.search(ln)]
-            reason = (bad[0] if bad else block.strip().splitlines()[-1] if block.strip() else "")[:120]
-        return ip, product, ok, reason
-
     def _tail(self):
-        """tail -F 日志文件，按"连接块"累计并入库（代替 journalctl -f + 单行正则）。"""
+        """tail -F 日志文件（vlmcsd 的 stdout 由 supervisord 落进这个文件）。"""
         while True:
             try:
                 self.log_file.parent.mkdir(parents=True, exist_ok=True)
@@ -894,7 +931,6 @@ class ContainerBackend(LinuxBackend):
                 with self.log_file.open("r", encoding="utf-8", errors="replace") as fh:
                     fh.seek(0, os.SEEK_END)
                     buf = ""
-                    block = []
                     while True:
                         chunk = fh.read()
                         if not chunk:
@@ -909,25 +945,8 @@ class ContainerBackend(LinuxBackend):
                         buf += chunk
                         while "\n" in buf:
                             line, buf = buf.split("\n", 1)
-                            line = line.rstrip()
-                            if not line:
-                                continue
-                            self.log_lines.append({"t": now_iso(),
-                                                   "level": self._level_of(line),
-                                                   "msg": line})
-                            del self.log_lines[:-400]
-                            if self.ACCEPT_RE.search(line):
-                                block = [line]
-                                continue
-                            if block:
-                                block.append(line)
-                                if self.CLOSE_RE.search(line):
-                                    ev = self._event_from_block("\n".join(block))
-                                    if ev:
-                                        ip, product, ok, reason = ev
-                                        self.store.add(int(time.time()), ip, product, "", ok, reason)
-                                    block = []
-            except Exception:
+                            self._feed(line.rstrip())
+            except Exception:  # noqa: BLE001
                 pass
             time.sleep(5)
 
@@ -1529,6 +1548,16 @@ class Handler(BaseHTTPRequestHandler):
                                         "srv": check_srv(f"_vlmcs._tcp.{domain}")})
             if u.path == "/api/stats/prune":
                 return self._send(200, {"ok": True, "removed": self.app["store"].prune(),
+                                        "summary": self.app["store"].summary()})
+            if u.path == "/api/stats/clear":
+                # 清空不可恢复，要求显式确认，避免前端误调
+                if not body.get("confirm"):
+                    return self._send(400, {"ok": False, "error": "清空记录需要 confirm=true"})
+                before = self.app["store"].size_bytes()
+                removed = self.app["store"].clear()
+                after = self.app["store"].size_bytes()
+                return self._send(200, {"ok": True, "removed": removed,
+                                        "freed_bytes": max(0, before - after),
                                         "summary": self.app["store"].summary()})
         except Exception as e:  # noqa: BLE001
             return self._send(500, {"error": str(e)})
