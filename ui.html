@@ -643,6 +643,12 @@
       </div>
     </div>
     <div class="panel glass">
+      <h2><svg class="ico"><use href="#i-shield"/></svg>面板登录限流
+        <span class="q">同一来源密码错太多次就封，而且一次比一次久；只按 IP 封，不锁账户</span>
+        <span class="end" id="gdMeta"></span></h2>
+      <div class="kv" id="gdBody"></div>
+    </div>
+    <div class="panel glass">
       <h2><svg class="ico"><use href="#i-file"/></svg>账户事件
         <span class="q">登录、失败、增删改都在这里</span></h2>
       <div class="scroll" style="max-height:300px"><table>
@@ -780,6 +786,37 @@ async function loadAccounts(){
       <td>${e.ok ? '<span class="tag ok">成功</span>' : '<span class="tag bad">失败</span>'}</td>
       <td class="hint">${esc(e.detail || "")}</td></tr>`).join("") ||
     '<tr><td colspan="6" class="empty">还没有记录</td></tr>';
+  renderGuard(j.guard);
+}
+/* 面板登录限流：谁被封了、还有多久、封到第几档 */
+function renderGuard(g){
+  const el = document.getElementById("gdBody");
+  if(!el) return;
+  if(!g){
+    el.innerHTML = '<div class="k">状态</div><div class="v hint">这个版本的后端没上报</div>';
+    document.getElementById("gdMeta").textContent = "";
+    return;
+  }
+  const blocked = g.blocked || [];
+  document.getElementById("gdMeta").textContent = blocked.length
+    ? (blocked.length + " 个来源被封") : "当前没有被封的来源";
+  el.innerHTML = [
+    ["规则", num(g.limit) + " 次失败 / " + dur(g.window) + " 内 → 封禁"],
+    ["档位", (g.tiers || []).map(s => dur(s)).join(" → ") || "–"],
+    ["跟踪中", num(g.tracked) + " 个来源"],
+  ].map(([k, v]) => `<div class="k">${esc(k)}</div><div class="v mono">${esc(v)}</div>`).join("") +
+    blocked.map(b => `<div class="k mono">${esc(b.ip)}</div>
+      <div class="v">第 ${num(b.level)} 档，还剩 ${dur(b.seconds)}
+      <button class="act ghost mini" style="margin-left:8px" onclick="unblock('${esc(b.ip)}')">解封</button></div>`).join("") +
+    '<div class="k"></div><div class="v hint">自己也被封了：SSH 上去用服务 token 解 —— ' +
+    '<code class="mono">curl -H "Authorization: Bearer $(cat /var/lib/nimbus/nimbus.token)" ' +
+    '-X POST -d \'{"ip":"你的IP"}\' http://127.0.0.1:8099/api/accounts/unblock</code></div>';
+}
+async function unblock(ip){
+  if(!confirm("解封 " + ip + " ？\n\n失败计数清零，但档位保留（再犯还是从原来那一档往上）。")) return;
+  const j = await api("/api/accounts/unblock", {method:"POST", body: JSON.stringify({ip})});
+  if(j.ok){ toast("已解封 " + esc(ip)); loadAccounts(); }
+  else toast(esc(j.error || "解封失败"), true);
 }
 function useTarget(name){
   document.getElementById("pwTarget").value = name;
