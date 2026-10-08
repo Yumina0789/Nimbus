@@ -1,0 +1,4 @@
+nimbus.db*
+nimbus.token
+__pycache__/
+*.pyc

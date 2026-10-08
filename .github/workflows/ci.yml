@@ -1,0 +1,133 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    name: python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.8", "3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Byte-compile and parse
+        run: |
+          set -euo pipefail
+          python3 -m py_compile nimbus.py
+          python3 -c 'import ast,pathlib; s=pathlib.Path("nimbus.py").read_text(encoding="utf-8"); ast.parse(s); print("nimbus.py parsed:", len(s.splitlines()), "lines")'
+
+      - name: Demo smoke test (start, probe, stop)
+        run: |
+          set -euo pipefail
+          DATA="$RUNNER_TEMP/nimbus-demo"
+          python3 nimbus.py --mode demo --port 8099 --token testtoken --data-dir "$DATA" >"$RUNNER_TEMP/demo.log" 2>&1 &
+          pid=$!
+          trap 'kill "$pid" 2>/dev/null || true' EXIT
+
+          ready=0
+          for _ in $(seq 1 40); do
+            if curl -fsS -o /dev/null "http://127.0.0.1:8099/"; then ready=1; break; fi
+            sleep 0.5
+          done
+          if [ "$ready" -ne 1 ]; then
+            echo "server never came up:"; cat "$RUNNER_TEMP/demo.log"; exit 1
+          fi
+
+          echo "--- GET / ---"
+          curl -fsS "http://127.0.0.1:8099/" -o "$RUNNER_TEMP/index.html"
+          grep -q '<title>Nimbus 管理面板</title>' "$RUNNER_TEMP/index.html"
+          echo "GET / -> 200, title ok"
+
+          echo "--- GET /api/meta ---"
+          curl -fsS "http://127.0.0.1:8099/api/meta" -o "$RUNNER_TEMP/meta.json"
+          python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); assert d["mode"]=="demo", d; assert d["real"] is False, d; print("meta ok:", d["version"], d["mode"])' "$RUNNER_TEMP/meta.json"
+
+          echo "--- GET /api/summary with Bearer token ---"
+          curl -fsS -H "Authorization: Bearer testtoken" "http://127.0.0.1:8099/api/summary" -o "$RUNNER_TEMP/summary.json"
+          python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); assert "service" in d and "stats" in d and "execstart" in d, sorted(d); print("summary ok:", d["service"]["version"], "storage", d["stats"]["quota_bytes"])' "$RUNNER_TEMP/summary.json"
+
+          echo "--- GET /api/summary without token must be 401 ---"
+          code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:8099/api/summary")"
+          echo "unauthorized status: $code"
+          test "$code" = "401"
+
+          echo "--- POST /api/login with the wrong token must be 403 ---"
+          code="$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' -d '{"token":"nope"}' "http://127.0.0.1:8099/api/login")"
+          echo "bad login status: $code"
+          test "$code" = "403"
+
+          kill "$pid"
+          wait "$pid" 2>/dev/null || true
+          echo "demo smoke test passed"
+
+      - name: Real mode without a KMS service must not crash
+        run: |
+          set -euo pipefail
+          DATA="$RUNNER_TEMP/nimbus-real"
+          python3 nimbus.py --mode real --port 8100 --token testtoken --data-dir "$DATA" \
+            --unit vlmcsd-does-not-exist --ini "$RUNNER_TEMP/absent-vlmcsd.ini" >"$RUNNER_TEMP/real.log" 2>&1 &
+          pid=$!
+          trap 'kill "$pid" 2>/dev/null || true' EXIT
+
+          ready=0
+          for _ in $(seq 1 40); do
+            if curl -fsS -o /dev/null "http://127.0.0.1:8100/api/meta"; then ready=1; break; fi
+            sleep 0.5
+          done
+          if [ "$ready" -ne 1 ]; then
+            echo "real-mode server never came up:"; cat "$RUNNER_TEMP/real.log"; exit 1
+          fi
+
+          curl -fsS -H "Authorization: Bearer testtoken" "http://127.0.0.1:8100/api/summary" -o "$RUNNER_TEMP/real-summary.json"
+          python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); s=d["service"]; assert s["available"] is False, s; assert s["running"] is False, s; assert s.get("hint"), s; print("real mode degrades gracefully:", s["hint"])' "$RUNNER_TEMP/real-summary.json"
+
+          curl -fsS -H "Authorization: Bearer testtoken" "http://127.0.0.1:8100/api/logs" -o "$RUNNER_TEMP/real-logs.json"
+          python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); assert d["lines"], d; print("real mode logs fallback ok")' "$RUNNER_TEMP/real-logs.json"
+
+          kill "$pid"
+          wait "$pid" 2>/dev/null || true
+
+  shell:
+    name: shellcheck and installer checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: bash syntax check
+        run: bash -n install.sh
+
+      - name: shellcheck
+        run: |
+          if [ -f install.sh ]; then
+            shellcheck --version
+            shellcheck install.sh
+          else
+            echo "no install.sh present"
+          fi
+
+      - name: install.sh --help
+        run: |
+          set -euo pipefail
+          out="$(bash install.sh --help)"
+          printf '%s\n' "$out"
+          for kw in --with-vlmcsd --no-vlmcsd --kms-port; do
+            if ! printf '%s' "$out" | grep -q -- "$kw"; then
+              echo "help output is missing: $kw" >&2
+              exit 1
+            fi
+          done
+          echo "help output mentions all documented KMS flags"

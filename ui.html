@@ -1,0 +1,828 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Nimbus 管理面板</title>
+<style>
+  :root{
+    --bg:linear-gradient(150deg,#ffffff 0%,#f8fcff 36%,#e6f3ff 74%,#ffffff 100%);
+    --bgc:#ffffff;
+    --blob1:#a9d6ff; --blob2:#c9e7ff; --blob3:#b6ddff; --blob4:#e2f2ff;
+    --glass:rgba(255,255,255,.58);
+    --glass-strong:rgba(255,255,255,.90);
+    --glass-soft:rgba(255,255,255,.50);
+    --gline:rgba(170,212,255,.75);
+    --line:rgba(47,111,237,.12);
+    --text:#16233b; --dim:#7089a8;
+    --accent:#1f9dff; --accent2:#a5dbff; --on-accent:#062a45; --accent-weak:rgba(31,157,255,.14);
+    --ok:#0d9c78; --warn:#c97800; --bad:#e0506b;
+    --overlay:rgba(255,255,255,.72);
+    --shadow:0 8px 28px rgba(31,90,160,.12),inset 0 1px 0 rgba(255,255,255,.80);
+    --blur:blur(22px) saturate(185%);
+    --r:14px; --gap:16px;
+  }
+  [data-theme="dark"]{
+    --bg:linear-gradient(150deg,#050b16 0%,#08131f 42%,#0b1e33 78%,#060e1c 100%);
+    --bgc:#050b16;
+    --blob1:#0e3f70; --blob2:#0a2544; --blob3:#155f96; --blob4:#07203a;
+    --glass:rgba(16,28,48,.55);
+    --glass-strong:rgba(20,34,56,.78);
+    --glass-soft:rgba(255,255,255,.05);
+    --gline:rgba(130,190,255,.22);
+    --line:rgba(130,190,255,.18);
+    --text:#e8f4ff; --dim:#8fa9c6;
+    --accent:#3fb0ff; --accent2:#9ddcff; --on-accent:#041d2e; --accent-weak:rgba(63,176,255,.20);
+    --ok:#3fd0a6; --warn:#eeb45f; --bad:#ff7585;
+    --overlay:rgba(5,11,22,.84);
+    --shadow:0 10px 30px rgba(0,0,0,.45),inset 0 1px 0 rgba(255,255,255,.06);
+    --blur:blur(22px) saturate(185%);
+  }
+  *{box-sizing:border-box}
+  html{-webkit-text-size-adjust:100%}
+  body{
+    margin:0;min-height:100vh;color:var(--text);
+    font:14px/1.55 "Segoe UI","Microsoft YaHei",system-ui,sans-serif;
+    font-variant-numeric:tabular-nums;
+    background-color:var(--bgc);
+    background-image:
+      radial-gradient(54vw 46vh at 4% -10%, var(--blob1) 0%, rgba(255,255,255,0) 62%),
+      radial-gradient(48vw 42vh at 100% -4%, var(--blob2) 0%, rgba(255,255,255,0) 60%),
+      radial-gradient(58vw 48vh at 88% 106%, var(--blob3) 0%, rgba(255,255,255,0) 62%),
+      radial-gradient(46vw 40vh at 0% 92%, var(--blob4) 0%, rgba(255,255,255,0) 60%),
+      var(--bg);
+    background-attachment:fixed;
+  }
+  a{color:var(--accent);text-decoration:none}
+  code,pre,.mono{font-family:Consolas,"Cascadia Mono",ui-monospace,monospace}
+
+  .glass{
+    background:var(--glass);
+    -webkit-backdrop-filter:var(--blur);backdrop-filter:var(--blur);
+    border:1px solid var(--gline);box-shadow:var(--shadow);border-radius:var(--r);
+  }
+  @supports not ((backdrop-filter:blur(1px)) or (-webkit-backdrop-filter:blur(1px))){
+    .glass{background:var(--glass-strong)}
+  }
+  .ico{width:16px;height:16px;flex:none;stroke:currentColor;fill:none;
+       stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+
+  /* 顶栏 ================================================================ */
+  header{position:sticky;top:0;z-index:20;padding:10px 0 0}
+  .hbar{max-width:1220px;margin:0 auto;display:flex;align-items:center;gap:10px;
+        padding:10px 16px;border-radius:var(--r)}
+  .hbar h1{font-size:15px;font-weight:650;margin:0;letter-spacing:.2px}
+  .hbar .sub{color:var(--dim);font-size:12px;padding-left:10px;border-left:1px solid var(--line)}
+  .grow{flex:1}
+  .pill{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line);
+        border-radius:999px;padding:4px 11px;font-size:12px;color:var(--dim);
+        background:var(--glass-soft);white-space:nowrap}
+  .pill.ok{color:var(--ok);border-color:currentColor}
+  .pill.bad{color:var(--bad);border-color:currentColor}
+  .pill .ico{width:13px;height:13px}
+
+  nav{max-width:1220px;margin:8px auto 0;padding:0 10px}
+  .nrow{display:flex;gap:4px;padding:6px;border-radius:var(--r);overflow-x:auto}
+  nav button{display:inline-flex;align-items:center;gap:7px;background:none;border:1px solid transparent;
+             border-radius:10px;color:var(--dim);padding:8px 13px;font:inherit;font-size:13.5px;
+             cursor:pointer;white-space:nowrap;transition:.15s}
+  nav button:hover{color:var(--text);background:var(--glass-soft)}
+  nav button.active{color:var(--on-accent);font-weight:600;border-color:transparent;
+    background:linear-gradient(135deg,var(--accent2),var(--accent));
+    box-shadow:0 6px 18px rgba(31,157,255,.30)}
+
+  main{max-width:1220px;margin:0 auto;padding:18px 18px 64px}
+
+  /* 面板与栅格 ========================================================== */
+  .panel{padding:16px 18px;margin-bottom:var(--gap)}
+  .panel > h2{font-size:13px;font-weight:650;margin:0 0 14px;display:flex;align-items:center;gap:8px}
+  .panel > h2 .ico{color:var(--accent)}
+  .panel > h2 .q{font-weight:400;color:var(--dim);font-size:12px;margin-left:2px}
+  .panel > h2 .end{margin-left:auto;font-weight:400;font-size:12px;color:var(--dim)}
+  .grid{display:grid;gap:var(--gap)}
+  .g2{grid-template-columns:repeat(auto-fit,minmax(320px,1fr))}
+  .g3{grid-template-columns:repeat(auto-fit,minmax(210px,1fr))}
+  .g4{grid-template-columns:repeat(auto-fit,minmax(168px,1fr))}
+  .split{display:grid;gap:var(--gap);grid-template-columns:minmax(0,2fr) minmax(0,1fr)}
+  @media (max-width:900px){ .split{grid-template-columns:minmax(0,1fr)} }
+
+  /* 指标卡 ============================================================== */
+  .stat{padding:13px 15px}
+  .stat .k{color:var(--dim);font-size:12px;display:flex;align-items:center;gap:6px}
+  .stat .k .ico{width:14px;height:14px;color:var(--accent)}
+  .stat .v{font-size:22px;font-weight:700;line-height:1.35;margin-top:2px}
+  .stat .n{color:var(--dim);font-size:12px}
+  .stat .n b{font-weight:600}
+  .ok-v{color:var(--ok)} .bad-v{color:var(--bad)} .warn-v{color:var(--warn)}
+
+  /* 表单 ================================================================ */
+  .fgroup{margin-bottom:16px;padding:14px 14px 4px;border:1px solid var(--line);border-radius:12px;
+          background:var(--glass-soft)}
+  .fgroup:last-of-type{margin-bottom:0}
+  .fgroup > h3{font-size:12px;font-weight:650;color:var(--dim);margin:0 0 12px;
+               display:flex;align-items:center;gap:6px;letter-spacing:.3px}
+  .fgroup > h3 .ico{width:14px;height:14px;color:var(--accent)}
+  label{display:block;font-size:12.5px;color:var(--dim);margin-bottom:5px}
+  label .flag{float:right;opacity:.7;font-size:11px}
+  input,select,textarea{width:100%;background:var(--glass-strong);border:1px solid var(--line);
+    color:var(--text);padding:8px 10px;border-radius:9px;font:inherit;font-size:13px}
+  input:focus,select:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-weak)}
+  .hint{color:var(--dim);font-size:12px}
+  .field .hint{margin-top:4px}
+  .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+  .toolbar{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:14px}
+  .foot{margin-top:16px;padding-top:14px;border-top:1px solid var(--line);
+        display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+
+  button.act{display:inline-flex;align-items:center;gap:7px;height:33px;padding:0 14px;
+    border-radius:9px;border:1px solid transparent;font:inherit;font-size:13px;font-weight:600;
+    cursor:pointer;transition:.15s;color:var(--on-accent);
+    background:linear-gradient(135deg,var(--accent2),var(--accent));
+    box-shadow:0 5px 16px rgba(31,157,255,.26)}
+  button.act:hover{transform:translateY(-1px)}
+  button.act:active{transform:translateY(0)}
+  button.act.ghost{background:var(--glass-soft);color:var(--text);border-color:var(--line);
+    font-weight:500;box-shadow:none}
+  button.act.ghost:hover{background:var(--glass-strong)}
+  button.act.danger{background:var(--glass-soft);color:var(--bad);border-color:var(--line);
+    font-weight:500;box-shadow:none}
+  button.act.danger:hover{background:var(--glass-strong)}
+  button.act:disabled{opacity:.45;cursor:not-allowed;transform:none}
+  button.act .ico{width:15px;height:15px}
+
+  /* 表格 ================================================================ */
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{text-align:left;padding:9px 12px;border-bottom:1px solid var(--line);white-space:nowrap}
+  th{color:var(--dim);font-weight:600;background:var(--glass-soft);position:sticky;top:0;
+     -webkit-backdrop-filter:var(--blur);backdrop-filter:var(--blur)}
+  th:first-child,td:first-child{padding-left:16px}
+  td.num,th.num{text-align:right}
+  tbody tr:hover{background:var(--glass-soft)}
+  tbody tr:last-child td{border-bottom:none}
+  .scroll{max-height:420px;overflow:auto;border:1px solid var(--line);border-radius:var(--r);
+          background:var(--glass-soft)}
+  .empty{padding:18px;color:var(--dim)}
+  .tag{display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:999px;
+       font-size:12px;border:1px solid currentColor}
+  .tag .ico{width:12px;height:12px}
+  .tag.ok{color:var(--ok)} .tag.bad{color:var(--bad)} .tag.info{color:var(--accent)}
+  .tag.mute{color:var(--dim)}
+
+  pre{background:var(--glass-soft);border:1px solid var(--line);border-radius:var(--r);
+      padding:12px 14px;overflow:auto;font-size:12.5px;margin:0;max-height:320px}
+  details{border:1px solid var(--line);border-radius:var(--r);background:var(--glass-soft);
+          padding:0 14px;margin-bottom:var(--gap)}
+  details[open]{padding-bottom:14px}
+  summary{cursor:pointer;padding:12px 0;font-size:13px;font-weight:600;list-style:none;
+          display:flex;align-items:center;gap:7px}
+  summary::-webkit-details-marker{display:none}
+  summary::before{content:"›";color:var(--accent);font-size:16px;transition:.15s}
+  details[open] summary::before{transform:rotate(90deg)}
+
+  /* 图表与排行 ========================================================== */
+  .bars{display:flex;align-items:flex-end;gap:3px;height:112px}
+  .bars .b{flex:1;min-height:3px;border-radius:4px 4px 2px 2px;position:relative;
+           background:linear-gradient(180deg,var(--accent2),var(--accent))}
+  .bars .b:hover::after{content:attr(data-tip);position:absolute;left:50%;top:-30px;
+    transform:translateX(-50%);background:var(--glass-strong);border:1px solid var(--line);
+    border-radius:8px;padding:3px 9px;font-size:11px;white-space:nowrap;z-index:9;color:var(--text)}
+  .bars .b span{position:absolute;inset:auto 0 -17px 0;text-align:center;color:var(--dim);font-size:10px}
+  .legend{color:var(--dim);font-size:12px;margin-top:20px}
+  .toplist{font-size:13px}
+  .toplist .r{display:flex;gap:10px;align-items:center;margin-bottom:8px}
+  .toplist .r:last-child{margin-bottom:0}
+  .toplist .r b{flex:1;font-weight:400;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .toplist .r .n{color:var(--dim);font-size:12px;min-width:34px;text-align:right}
+  .toplist .bar{height:6px;background:var(--glass-soft);border:1px solid var(--line);
+                border-radius:999px;overflow:hidden;width:74px}
+  .toplist .bar i{display:block;height:100%;border-radius:999px;
+                  background:linear-gradient(90deg,var(--accent2),var(--accent))}
+  .toplist .bar.warn i{background:linear-gradient(90deg,#ffc9ad,var(--bad))}
+
+  /* 日志与键值 ========================================================== */
+  .logbox{font-family:Consolas,"Cascadia Mono",monospace;font-size:12.5px;max-height:400px;
+          overflow:auto;border:1px solid var(--line);border-radius:var(--r);padding:8px 12px;
+          background:var(--glass-soft)}
+  .logline{display:flex;gap:10px;padding:2px 0}
+  .logline .t{color:var(--dim);min-width:72px}
+  .logline.warn{color:var(--warn)} .logline.ok{color:var(--ok)}
+  .kv{display:grid;grid-template-columns:92px 1fr;gap:7px 14px;font-size:13px}
+  .kv .k{color:var(--dim)}
+  .kv .v{overflow-wrap:anywhere}
+
+  .toast{position:fixed;right:20px;bottom:20px;z-index:80;max-width:400px;display:flex;gap:9px;
+    align-items:flex-start;padding:12px 15px;font-size:13px;opacity:0;transform:translateY(8px);
+    transition:.2s;pointer-events:none}
+  .toast.show{opacity:1;transform:none}
+  .toast .ico{width:16px;height:16px;color:var(--accent);margin-top:2px}
+  .toast.err .ico{color:var(--bad)}
+
+  #login{position:fixed;inset:0;z-index:90;display:grid;place-items:center;
+         background:var(--overlay);-webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px)}
+  #login .box{width:min(390px,92vw);padding:20px}
+  .hidden{display:none !important}
+  @media (max-width:640px){
+    .hbar{margin:0 10px} nav{margin:8px 10px 0} main{padding:14px 12px 56px}
+  }
+</style>
+</head>
+<body>
+
+<!-- 图标库（内联 SVG，无外链） -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></symbol>
+  <symbol id="i-sliders" viewBox="0 0 24 24"><path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/></symbol>
+  <symbol id="i-server" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 7.5h.01M7 16.5h.01"/></symbol>
+  <symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.5 2.6 2.5 15.4 0 18M12 3c-2.5 2.6-2.5 15.4 0 18"/></symbol>
+  <symbol id="i-chart" viewBox="0 0 24 24"><path d="M4 20h16"/><rect x="6" y="11" width="3" height="6" rx="1"/><rect x="11" y="7" width="3" height="10" rx="1"/><rect x="16" y="13" width="3" height="4" rx="1"/></symbol>
+  <symbol id="i-pulse" viewBox="0 0 24 24"><path d="M3 12h4l2.5-6 4 12L16 12h5"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="M20 6.5 9.5 17 4 11.5"/></symbol>
+  <symbol id="i-check-circle" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M8.5 12.5l2.5 2.5 4.5-5"/></symbol>
+  <symbol id="i-x-circle" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M9 9l6 6M15 9l-6 6"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><circle cx="9" cy="8" r="3.2"/><path d="M3.5 20c.6-3.2 2.9-5 5.5-5s4.9 1.8 5.5 5"/><path d="M16 8.2a3 3 0 0 1 0 5.6M17 20c-.2-1.6-.6-2.9-1.3-3.9"/></symbol>
+  <symbol id="i-database" viewBox="0 0 24 24"><ellipse cx="12" cy="6" rx="7.5" ry="3"/><path d="M4.5 6v12c0 1.7 3.4 3 7.5 3s7.5-1.3 7.5-3V6M4.5 12c0 1.7 3.4 3 7.5 3s7.5-1.3 7.5-3"/></symbol>
+  <symbol id="i-percent" viewBox="0 0 24 24"><path d="M19 5 5 19"/><circle cx="7.5" cy="7.5" r="2.5"/><circle cx="16.5" cy="16.5" r="2.5"/></symbol>
+  <symbol id="i-save" viewBox="0 0 24 24"><path d="M5 3h10l4 4v14H5z"/><path d="M9 3v6h6V3M8 17h8"/></symbol>
+  <symbol id="i-undo" viewBox="0 0 24 24"><path d="M4 9h9a5 5 0 0 1 0 10H8"/><path d="M7.5 5.5 4 9l3.5 3.5"/></symbol>
+  <symbol id="i-play" viewBox="0 0 24 24"><path d="M7 4.5 19 12 7 19.5z"/></symbol>
+  <symbol id="i-stop" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/></symbol>
+  <symbol id="i-restart" viewBox="0 0 24 24"><path d="M20 12a8 8 0 1 1-2.6-5.9"/><path d="M20 4v4.5h-4.5"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/><path d="M15.5 15.5 21 21"/></symbol>
+  <symbol id="i-broom" viewBox="0 0 24 24"><path d="M14 4l6 6-6.5 6.5-6-6z"/><path d="M7 11l-3.5 8.5L12 16"/></symbol>
+  <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M19.1 4.9l-1.4 1.4M6.3 17.7l-1.4 1.4"/></symbol>
+  <symbol id="i-moon" viewBox="0 0 24 24"><path d="M20 14.5A8.5 8.5 0 0 1 9.5 4a8.5 8.5 0 1 0 10.5 10.5z"/></symbol>
+  <symbol id="i-logout" viewBox="0 0 24 24"><path d="M15 4h4v16h-4"/><path d="M10 8l-4 4 4 4M6 12h9"/></symbol>
+  <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 3l7 3v6c0 4.2-2.9 7.6-7 9-4.1-1.4-7-4.8-7-9V6z"/><path d="M9 12.5 11 14.5 15.5 10"/></symbol>
+  <symbol id="i-terminal" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9l3 3-3 3M13 15h4"/></symbol>
+  <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="7" y="7" width="10" height="10" rx="2"/><path d="M4 10v4M20 10v4M10 4h4M10 20h4M7 4v2M17 4v2M7 18v2M17 18v2"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5.5l3.5 2"/></symbol>
+  <symbol id="i-file" viewBox="0 0 24 24"><path d="M6 3h8l4 4v14H6z"/><path d="M14 3v4h4"/></symbol>
+  <symbol id="i-network" viewBox="0 0 24 24"><rect x="9" y="3" width="6" height="5" rx="1.5"/><rect x="2" y="16" width="6" height="5" rx="1.5"/><rect x="16" y="16" width="6" height="5" rx="1.5"/><path d="M12 8v4M5 16v-4h14v4"/></symbol>
+  <symbol id="i-left" viewBox="0 0 24 24"><path d="M14 6l-6 6 6 6"/></symbol>
+  <symbol id="i-right" viewBox="0 0 24 24"><path d="M10 6l6 6-6 6"/></symbol>
+  <symbol id="i-wifi" viewBox="0 0 24 24"><path d="M4 9a13 13 0 0 1 16 0M7 12.5a8.5 8.5 0 0 1 10 0M10 16a4 4 0 0 1 4 0"/><circle cx="12" cy="19.5" r=".8"/></symbol>
+</svg>
+
+<!-- 登录 -->
+<div id="login" class="hidden">
+  <div class="box glass panel">
+    <h2><svg class="ico"><use href="#i-shield"/></svg>Nimbus 管理面板</h2>
+    <div class="field">
+      <label>访问 token</label>
+      <input id="loginToken" type="password" placeholder="启动时终端输出的一串 token">
+      <div class="hint">token 保存在服务器 nimbus.token（权限 600）。</div>
+    </div>
+    <button class="act" style="width:100%" onclick="doLogin()">
+      <svg class="ico"><use href="#i-check"/></svg>登录</button>
+    <div id="loginErr" class="hint bad-v" style="margin-top:8px"></div>
+  </div>
+</div>
+
+<header>
+  <div class="hbar glass">
+    <h1>Nimbus 管理面板</h1>
+    <div class="sub" id="modeLine">连接中</div>
+    <div class="grow"></div>
+    <span class="pill" id="svcPill"><svg class="ico"><use href="#i-pulse"/></svg>状态</span>
+    <span class="pill" id="storePill"><svg class="ico"><use href="#i-database"/></svg>存储</span>
+    <button class="act ghost" id="themeBtn" onclick="toggleTheme()">
+      <svg class="ico"><use href="#i-moon"/></svg>深色</button>
+    <button class="act ghost" onclick="logout()">
+      <svg class="ico"><use href="#i-logout"/></svg>退出</button>
+  </div>
+  <nav>
+    <div class="nrow glass">
+      <button data-tab="overview" class="active"><svg class="ico"><use href="#i-grid"/></svg>概览</button>
+      <button data-tab="config"><svg class="ico"><use href="#i-sliders"/></svg>参数</button>
+      <button data-tab="service"><svg class="ico"><use href="#i-server"/></svg>服务与日志</button>
+      <button data-tab="domain"><svg class="ico"><use href="#i-globe"/></svg>域名与 HTTPS</button>
+      <button data-tab="stats"><svg class="ico"><use href="#i-chart"/></svg>激活统计</button>
+    </div>
+  </nav>
+</header>
+
+<main>
+  <!-- 概览 -->
+  <section id="tab-overview">
+    <div class="grid g4" style="margin-bottom:var(--gap)">
+      <div class="stat glass"><div class="k"><svg class="ico"><use href="#i-pulse"/></svg>服务状态</div>
+        <div class="v" id="ovState">–</div><div class="n" id="ovSince"></div></div>
+      <div class="stat glass"><div class="k"><svg class="ico"><use href="#i-check-circle"/></svg>今日激活</div>
+        <div class="v" id="ovToday">–</div><div class="n" id="ovTodayOk"></div></div>
+      <div class="stat glass"><div class="k"><svg class="ico"><use href="#i-users"/></svg>30 天客户端</div>
+        <div class="v" id="ovClients">–</div><div class="n" id="ovTotal"></div></div>
+      <div class="stat glass"><div class="k"><svg class="ico"><use href="#i-database"/></svg>统计库</div>
+        <div class="v" id="ovStore">–</div><div class="n" id="ovQuota"></div></div>
+    </div>
+
+    <div class="split" style="margin-bottom:var(--gap)">
+      <div class="panel glass" style="margin:0">
+        <h2><svg class="ico"><use href="#i-chart"/></svg>激活趋势
+          <span class="q">近 14 天</span><span class="end" id="ovBarsLegend"></span></h2>
+        <div class="bars" id="ovBars"></div>
+      </div>
+      <div class="panel glass" style="margin:0">
+        <h2><svg class="ico"><use href="#i-cpu"/></svg>运行信息</h2>
+        <div class="kv">
+          <div class="k">版本</div><div class="v" id="ovVersion">–</div>
+          <div class="k">进程 PID</div><div class="v" id="ovPid">–</div>
+          <div class="k">程序路径</div><div class="v mono" id="ovBin">–</div>
+          <div class="k">程序 SHA-256</div><div class="v mono" style="font-size:12px" id="ovSha">–</div>
+          <div class="k">最近激活</div><div class="v" id="ovLast">–</div>
+        </div>
+      </div>
+    </div>
+
+    <details>
+      <summary><svg class="ico"><use href="#i-terminal"/></svg>当前生效的命令行</summary>
+      <pre id="ovExec" style="margin-top:12px">–</pre>
+    </details>
+  </section>
+
+  <!-- 参数 -->
+  <section id="tab-config" class="hidden">
+    <div class="panel glass">
+      <h2><svg class="ico"><use href="#i-sliders"/></svg>运行参数
+        <span class="q">写入 vlmcsd.ini 后发送 SIGHUP 重载，不断开现有客户端</span></h2>
+      <div id="cfgForm"></div>
+      <div class="foot">
+        <button class="act" id="cfgSave" onclick="saveConfig()">
+          <svg class="ico"><use href="#i-save"/></svg>保存并重载</button>
+        <button class="act ghost" onclick="loadConfig()">
+          <svg class="ico"><use href="#i-undo"/></svg>放弃修改</button>
+        <button class="act danger" onclick="rollback()">
+          <svg class="ico"><use href="#i-undo"/></svg>回滚上一份配置</button>
+        <span class="hint" id="cfgState"></span>
+      </div>
+    </div>
+  </section>
+
+  <!-- 服务与日志 -->
+  <section id="tab-service" class="hidden">
+    <div class="grid g4" style="margin-bottom:var(--gap)">
+      <div class="stat glass"><div class="k"><svg class="ico"><use href="#i-pulse"/></svg>服务状态</div>
+        <div class="v" id="svcStateV">–</div><div class="n" id="svcUnitV">systemd · vlmcsd</div></div>
+      <div class="stat glass"><div class="k"><svg class="ico"><use href="#i-cpu"/></svg>进程 PID</div>
+        <div class="v" id="svcPidV">–</div><div class="n" id="svcBinV">–</div></div>
+      <div class="stat glass"><div class="k"><svg class="ico"><use href="#i-clock"/></svg>启动时间</div>
+        <div class="v" style="font-size:16px" id="svcSinceV">–</div><div class="n" id="svcUpV">–</div></div>
+      <div class="stat glass"><div class="k"><svg class="ico"><use href="#i-file"/></svg>日志行数</div>
+        <div class="v" id="svcLogV">–</div><div class="n">最近 200 行</div></div>
+    </div>
+    <div class="panel glass">
+      <h2><svg class="ico"><use href="#i-server"/></svg>服务控制
+        <span class="q">端口与监听地址改动需重启，其余参数只需重载</span></h2>
+      <div class="row">
+        <button class="act" onclick="svc('start')"><svg class="ico"><use href="#i-play"/></svg>启动</button>
+        <button class="act ghost" onclick="svc('restart')"><svg class="ico"><use href="#i-restart"/></svg>重启</button>
+        <button class="act danger" onclick="svc('stop')"><svg class="ico"><use href="#i-stop"/></svg>停止</button>
+        <span class="hint" id="svcState"></span>
+      </div>
+    </div>
+    <div class="panel glass">
+      <h2><svg class="ico"><use href="#i-file"/></svg>运行日志
+        <span class="end" id="logMeta"></span></h2>
+      <div class="logbox" id="logBox"></div>
+    </div>
+  </section>
+
+  <!-- 域名与 HTTPS -->
+  <section id="tab-domain" class="hidden">
+    <div class="panel glass">
+      <h2><svg class="ico"><use href="#i-globe"/></svg>域名与证书
+        <span class="q">DNS 记录在域名服务商处添加，Caddy 自动申请并续期证书</span></h2>
+      <div class="grid g3">
+        <div class="field"><label>管理界面域名</label>
+          <input id="dmName" placeholder="kms-admin.example.com"></div>
+        <div class="field"><label>Let's Encrypt 邮箱</label>
+          <input id="dmMail" placeholder="you@example.com"><div class="hint">可留空</div></div>
+        <div class="field" style="align-self:start">
+          <div class="row" style="margin-top:22px">
+            <button class="act" onclick="checkDomain()">
+              <svg class="ico"><use href="#i-search"/></svg>检查解析</button>
+            <button class="act ghost" onclick="loadCaddy()">
+              <svg class="ico"><use href="#i-shield"/></svg>生成配置</button>
+          </div>
+        </div>
+      </div>
+      <div id="dmResult" class="grid g2" style="margin-top:6px"></div>
+    </div>
+
+    <div class="panel glass hidden" id="dnsPanel">
+      <h2><svg class="ico"><use href="#i-network"/></svg>DNS 记录</h2>
+      <div class="scroll"><table>
+        <thead><tr><th>类型</th><th>名称</th><th>值</th><th>作用</th></tr></thead>
+        <tbody id="dnsBody"></tbody></table></div>
+      <div class="hint" id="dmNotes" style="margin-top:12px"></div>
+    </div>
+
+    <details id="caddyPanel" class="hidden">
+      <summary><svg class="ico"><use href="#i-shield"/></svg>Caddyfile</summary>
+      <pre id="caddyBox" style="margin-top:12px"></pre>
+    </details>
+  </section>
+
+  <!-- 激活统计 -->
+  <section id="tab-stats" class="hidden">
+    <div class="grid g4" style="margin-bottom:var(--gap)">
+      <div class="stat glass"><div class="k"><svg class="ico"><use href="#i-chart"/></svg>窗口内激活</div>
+        <div class="v" id="stTotal">–</div><div class="n" id="stWindow"></div></div>
+      <div class="stat glass"><div class="k"><svg class="ico"><use href="#i-percent"/></svg>成功率</div>
+        <div class="v" id="stRate">–</div><div class="n" id="stRateNote"></div></div>
+      <div class="stat glass"><div class="k"><svg class="ico"><use href="#i-x-circle"/></svg>被拒绝</div>
+        <div class="v" id="stFail">–</div><div class="n" id="stFailNote"></div></div>
+      <div class="stat glass"><div class="k"><svg class="ico"><use href="#i-database"/></svg>统计库</div>
+        <div class="v" id="stStore">–</div><div class="n" id="stQuota"></div></div>
+    </div>
+
+    <div class="grid g2" style="margin-bottom:var(--gap)">
+      <div class="panel glass" style="margin:0">
+        <h2><svg class="ico"><use href="#i-check-circle"/></svg>按产品</h2>
+        <div class="toplist" id="stProducts"></div>
+      </div>
+      <div class="panel glass" style="margin:0">
+        <h2><svg class="ico"><use href="#i-x-circle"/></svg>拒绝原因</h2>
+        <div class="toplist" id="stFails"></div>
+      </div>
+    </div>
+
+    <div class="panel glass">
+      <h2><svg class="ico"><use href="#i-file"/></svg>激活明细</h2>
+      <div class="toolbar">
+        <input id="stQ" placeholder="搜索 IP 或客户端版本" style="width:200px" oninput="stDebounce()">
+        <select id="stResult" style="width:118px" onchange="loadStats(1)">
+          <option value="">全部结果</option><option value="ok">成功</option><option value="fail">失败</option>
+        </select>
+        <select id="stDays" style="width:118px" onchange="loadStats(1)">
+          <option value="7">近 7 天</option><option value="30" selected>近 30 天</option>
+          <option value="90">近 90 天</option><option value="3650">全部</option>
+        </select>
+        <span class="hint" id="stMeta"></span>
+        <div class="grow"></div>
+        <button class="act ghost" onclick="prune()">
+          <svg class="ico"><use href="#i-broom"/></svg>按配额清理</button>
+      </div>
+      <div class="scroll"><table>
+        <thead><tr><th>时间</th><th>客户端</th><th>产品</th><th>版本</th><th>结果</th><th class="num">耗时</th></tr></thead>
+        <tbody id="stBody"></tbody></table></div>
+      <div class="row" style="margin-top:14px">
+        <button class="act ghost" onclick="loadStats(stPage-1)">
+          <svg class="ico"><use href="#i-left"/></svg>上一页</button>
+        <span class="hint" id="stPageInfo">–</span>
+        <button class="act ghost" onclick="loadStats(stPage+1)">下一页
+          <svg class="ico"><use href="#i-right"/></svg></button>
+      </div>
+    </div>
+  </section>
+</main>
+
+<div class="toast glass" id="toast"><svg class="ico"><use href="#i-check-circle"/></svg><span id="toastMsg"></span></div>
+
+<script>
+const TOKEN_KEY = "nimbus_token", THEME_KEY = "nimbus_theme";
+let TOKEN = new URLSearchParams(location.search).get("token") || localStorage.getItem(TOKEN_KEY) || "";
+let SCHEMA = [], LOADED = {}, stPage = 1, stTimer = null, lastRunning = null, dirty = false;
+
+/* --- 主题 ------------------------------------------------------------- */
+function applyTheme(t){
+  document.documentElement.dataset.theme = t;
+  document.getElementById("themeBtn").innerHTML = t === "dark"
+    ? '<svg class="ico"><use href="#i-sun"/></svg>浅色'
+    : '<svg class="ico"><use href="#i-moon"/></svg>深色';
+}
+function toggleTheme(){
+  const t = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
+  localStorage.setItem(THEME_KEY, t); applyTheme(t);
+}
+
+/* --- 工具 ------------------------------------------------------------- */
+function num(n){ return (n ?? 0).toLocaleString("zh-CN"); }
+function esc(s){
+  return String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+function bytes(n){
+  if(n == null) return "–";
+  const u = ["B","KB","MB","GB","TB"]; let i = 0;
+  while(n >= 1024 && i < u.length - 1){ n /= 1024; i++; }
+  return (i === 0 ? n : n.toFixed(1)) + " " + u[i];
+}
+function dur(sec){
+  if(!sec) return "–";
+  const d = Math.floor(sec/86400), h = Math.floor(sec%86400/3600), m = Math.floor(sec%3600/60);
+  if(d) return d + " 天 " + h + " 小时";
+  if(h) return h + " 小时 " + m + " 分";
+  return m + " 分";
+}
+function toast(msg, isErr){
+  const el = document.getElementById("toast");
+  document.getElementById("toastMsg").innerHTML = msg;
+  el.querySelector("use").setAttribute("href", isErr ? "#i-x-circle" : "#i-check-circle");
+  el.className = "toast glass show" + (isErr ? " err" : "");
+  clearTimeout(el._h);
+  el._h = setTimeout(() => el.className = "toast glass", 4000);
+}
+async function api(path, opts={}){
+  const r = await fetch(path, {...opts, headers:{
+    "Authorization": "Bearer " + TOKEN, "Content-Type": "application/json", ...(opts.headers || {})}});
+  if(r.status === 401){ showLogin(); throw new Error("unauthorized"); }
+  return r.json();
+}
+
+/* --- 登录 ------------------------------------------------------------- */
+function showLogin(){ document.getElementById("login").classList.remove("hidden"); }
+function logout(){ localStorage.removeItem(TOKEN_KEY); TOKEN = ""; showLogin(); }
+async function doLogin(){
+  const t = document.getElementById("loginToken").value.trim();
+  const r = await fetch("/api/login", {method:"POST", headers:{"Content-Type":"application/json"},
+                                       body: JSON.stringify({token:t})});
+  const j = await r.json();
+  if(j.ok){
+    TOKEN = j.token; localStorage.setItem(TOKEN_KEY, TOKEN);
+    document.getElementById("login").classList.add("hidden"); boot();
+  } else document.getElementById("loginErr").textContent = j.error || "登录失败";
+}
+
+/* --- 启动 ------------------------------------------------------------- */
+async function boot(){
+  try{
+    const meta = await api("/api/meta");
+    SCHEMA = meta.schema;
+    document.getElementById("modeLine").textContent =
+      (meta.real ? "真机模式" : "演示模式") + " · 后端 v" + meta.version + " · 启动于 " + meta.started;
+    renderForm();
+    await Promise.all([loadSummary(), loadConfig(), loadLogs(), loadStats(1)]);
+    setInterval(loadSummary, 5000);
+    setInterval(loadLogs, 5000);
+  }catch(e){ if(e.message !== "unauthorized") toast("加载失败：" + esc(e.message), true); }
+}
+
+/* --- 概览 ------------------------------------------------------------- */
+async function loadSummary(){
+  try{
+    const j = await api("/api/summary");
+    const s = j.service, st = j.stats;
+    /* 找不到被管理的 KMS 服务（没装 vlmcsd / 单元名不对）时如实降级显示，不假装在跑 */
+    const missing = s.available === false;
+    const stEl = document.getElementById("ovState");
+    stEl.textContent = missing ? "未检测到服务" : (s.running ? "运行中" : "已停止");
+    stEl.className = "v " + (missing ? "warn-v" : (s.running ? "ok-v" : "bad-v"));
+    document.getElementById("ovSince").textContent =
+      missing ? (s.hint || "") : (s.since ? "自 " + s.since : "");
+    document.getElementById("ovToday").textContent = num(st.today);
+    document.getElementById("ovTodayOk").innerHTML =
+      '成功 <b class="ok-v">' + num(st.today_ok) + '</b> · 失败 <b class="bad-v">' + num(st.today - st.today_ok) + '</b>';
+    document.getElementById("ovClients").textContent = num(st.clients_30d);
+    document.getElementById("ovTotal").textContent = "累计 " + num(st.total) + " 次激活";
+    document.getElementById("ovStore").textContent = bytes(st.storage_bytes);
+    document.getElementById("ovQuota").textContent = "配额 " + bytes(st.quota_bytes);
+    document.getElementById("ovExec").textContent = j.execstart;
+    document.getElementById("ovVersion").textContent = s.version || "–";
+    document.getElementById("ovPid").textContent = s.pid ?? "–";
+    document.getElementById("ovBin").textContent = s.binary || "–";
+    document.getElementById("ovSha").textContent = s.sha256 || "–";
+    document.getElementById("ovLast").textContent = st.last || "–";
+
+    const pill = document.getElementById("svcPill");
+    pill.innerHTML = '<svg class="ico"><use href="#i-' + (missing ? "x-circle" : s.running ? "pulse" : "x-circle") + '"/></svg>'
+                   + (missing ? "未检测到 KMS 服务" : (s.running ? "服务运行中" : "服务已停止"));
+    pill.className = "pill " + (missing ? "bad" : (s.running ? "ok" : "bad"));
+    document.getElementById("storePill").innerHTML =
+      '<svg class="ico"><use href="#i-database"/></svg>' + bytes(st.storage_bytes) + " / " + bytes(st.quota_bytes);
+
+    document.getElementById("svcStateV").textContent =
+      missing ? "未检测到服务" : (s.running ? "运行中" : "已停止");
+    document.getElementById("svcStateV").className = "v " + (missing ? "warn-v" : (s.running ? "ok-v" : "bad-v"));
+    const unitEl = document.getElementById("svcUnitV");
+    if(unitEl) unitEl.textContent = (missing ? "未检测到 " : "systemd · ") + (s.unit || "vlmcsd");
+    document.getElementById("svcPidV").textContent = s.pid ?? "–";
+    document.getElementById("svcBinV").textContent = s.binary || "–";
+    document.getElementById("svcSinceV").textContent = s.since || "–";
+    document.getElementById("svcUpV").textContent = s.uptime ? "已运行 " + dur(s.uptime) : "";
+
+    if(lastRunning !== null && lastRunning !== s.running)
+      toast(s.running ? "服务已启动" : "服务已停止", !s.running);
+    lastRunning = s.running;
+
+    const ser = await api("/api/stats?days=14&per=1");
+    drawBars(ser.series);
+  }catch(e){ /* 忽略瞬时错误 */ }
+}
+function drawBars(series){
+  const max = Math.max(1, ...series.map(d => d.ok + d.fail));
+  document.getElementById("ovBars").innerHTML = series.map(d => {
+    const total = d.ok + d.fail;
+    return `<div class="b" style="height:${Math.max(3, Math.round(total / max * 100))}%"
+              data-tip="${d.day} · 成功 ${d.ok} · 失败 ${d.fail}"><span>${d.day.slice(5)}</span></div>`;
+  }).join("");
+  const sum = series.reduce((a, d) => a + d.ok + d.fail, 0);
+  const fail = series.reduce((a, d) => a + d.fail, 0);
+  document.getElementById("ovBarsLegend").textContent =
+    "共 " + num(sum) + " 次 · 失败 " + num(fail) + "（" + (sum ? (fail / sum * 100).toFixed(1) : 0) + "%）";
+}
+
+/* --- 参数 ------------------------------------------------------------- */
+const GROUPS = [
+  ["网络", "network", ["Port", "Listen"]],
+  ["并发与超时", "clock", ["MaxWorkers", "MaxIdleTime"]],
+  ["策略", "shield", ["WhitelistingLevel", "CheckClientTime"]],
+  ["日志", "file", ["LogFile", "LogLevel"]]
+];
+function renderForm(){
+  const byKey = Object.fromEntries(SCHEMA.map(f => [f.key, f]));
+  document.getElementById("cfgForm").innerHTML = GROUPS.map(([title, icon, keys]) => {
+    const fields = keys.map(k => byKey[k]).filter(Boolean).map(f => {
+      let inp;
+      if(f.type === "bool")
+        inp = `<select id="f_${f.key}"><option value="1">开启</option><option value="0">关闭</option></select>`;
+      else if(f.type === "choice")
+        inp = `<select id="f_${f.key}">${f.choices.map(c => `<option value="${esc(c[0])}">${esc(c[1])}</option>`).join("")}</select>`;
+      else
+        inp = `<input id="f_${f.key}" type="${f.type === "int" ? "number" : "text"}"
+                      ${f.min != null ? `min="${f.min}" max="${f.max}"` : ""}>`;
+      return `<div class="field"><label>${esc(f.label)}<span class="flag">${esc(f.flag || "")}</span></label>
+              ${inp}<div class="hint">${esc(f.help)}</div></div>`;
+    }).join("");
+    return `<div class="fgroup"><h3><svg class="ico"><use href="#i-${icon}"/></svg>${esc(title)}</h3>
+              <div class="grid g3" style="margin-bottom:10px">${fields}</div></div>`;
+  }).join("");
+  document.getElementById("cfgForm").addEventListener("input", markDirty);
+  document.getElementById("cfgForm").addEventListener("change", markDirty);
+}
+function markDirty(){
+  dirty = JSON.stringify(collect()) !== JSON.stringify(LOADED);
+  document.getElementById("cfgState").innerHTML = dirty
+    ? '<span class="warn-v">有未保存的修改</span>' : "";
+  document.getElementById("cfgSave").disabled = !dirty;
+}
+async function loadConfig(){
+  const j = await api("/api/config");
+  LOADED = {};
+  for(const f of SCHEMA){
+    const el = document.getElementById("f_" + f.key);
+    const v = j.config[f.key];
+    LOADED[f.key] = f.type === "bool" ? !!v : String(v);
+    if(!el) continue;
+    el.value = f.type === "bool" ? (v ? "1" : "0") : v;
+  }
+  dirty = false;
+  document.getElementById("cfgState").textContent = "";
+  document.getElementById("cfgSave").disabled = true;
+}
+function collect(){
+  const out = {};
+  for(const f of SCHEMA){
+    const el = document.getElementById("f_" + f.key);
+    if(!el) continue;
+    out[f.key] = f.type === "bool" ? el.value === "1" : String(el.value);
+  }
+  return out;
+}
+async function saveConfig(){
+  const j = await api("/api/config", {method:"POST", body: JSON.stringify(collect())});
+  if(j.ok){
+    if(j.restart_required){
+      document.getElementById("cfgState").innerHTML = '<span class="warn-v">已保存，需重启生效</span>';
+      toast("参数已保存，端口或监听地址改动需要重启");
+    } else {
+      document.getElementById("cfgState").innerHTML = '<span class="ok-v">已保存并重载</span>';
+      toast("参数已保存并热重载");
+    }
+    await loadConfig(); loadSummary();
+  } else toast("校验未通过：<br>" + (j.errors || []).map(esc).join("<br>"), true);
+}
+async function rollback(){
+  const j = await api("/api/config/rollback", {method:"POST"});
+  if(j.ok){ toast("已回滚上一份配置"); await loadConfig(); loadSummary(); }
+  else toast((j.errors || []).map(esc).join("<br>"), true);
+}
+
+/* --- 服务与日志 -------------------------------------------------------- */
+async function svc(action){
+  const label = {start:"启动", stop:"停止", restart:"重启"}[action];
+  const j = await api("/api/service", {method:"POST", body: JSON.stringify({action})});
+  if(j.ok){ toast("服务已" + label); loadSummary(); loadLogs(); }
+  else toast((j.errors || []).map(esc).join("<br>"), true);
+}
+async function loadLogs(){
+  try{
+    const j = await api("/api/logs?lines=200");
+    const box = document.getElementById("logBox");
+    const atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 30;
+    box.innerHTML = j.lines.map(l =>
+      `<div class="logline ${esc(l.level)}"><span class="t">${esc(l.t || "")}</span>
+        <span>${esc(l.msg)}</span></div>`).join("") || '<div class="empty">暂无日志</div>';
+    document.getElementById("logMeta").textContent = "共 " + j.lines.length + " 行 · 每 5 秒刷新";
+    document.getElementById("svcLogV").textContent = num(j.lines.length);
+    if(atBottom) box.scrollTop = box.scrollHeight;
+  }catch(e){}
+}
+
+/* --- 域名与 HTTPS ------------------------------------------------------ */
+function resultCard(icon, title, valueHtml, note, ok){
+  return `<div class="stat glass"><div class="k"><svg class="ico"><use href="#i-${icon}"/></svg>${title}
+            ${ok === undefined ? "" : `<span class="tag ${ok ? "ok" : "bad"}" style="margin-left:auto">
+              <svg class="ico"><use href="#i-${ok ? "check" : "x-circle"}"/></svg>${ok ? "正常" : "异常"}</span>`}
+            </div>
+            <div class="v" style="font-size:14px;font-weight:500">${valueHtml}</div>
+            <div class="n">${note}</div></div>`;
+}
+async function checkDomain(){
+  const domain = document.getElementById("dmName").value.trim();
+  if(!domain) return toast("请先填写域名", true);
+  const j = await api("/api/domain/check", {method:"POST", body: JSON.stringify({domain})});
+  const a = j.a, s = j.srv;
+  document.getElementById("dmResult").innerHTML =
+    resultCard("globe", "A 记录 " + esc(domain),
+               a.ok ? a.values.map(esc).join("<br>") : "解析失败",
+               a.ok ? "解析正常，浏览器可指向此服务器" : esc(a.error || ""), a.ok) +
+    resultCard("wifi", "SRV 记录 _vlmcs._tcp",
+               s.ok ? (s.values.length
+                        ? s.values.map(v => `${v.priority} ${v.weight} ${v.port} ${esc(v.target)}`).join("<br>")
+                        : "未查询到记录")
+                    : "查询不可用",
+               s.ok ? "客户端可据此自动发现 KMS 主机" : esc(s.error || ""),
+               s.ok ? s.values.length > 0 : undefined);
+  toast(a.ok ? "DNS 检查完成" : "DNS 检查完成，存在问题", !a.ok);
+}
+async function loadCaddy(){
+  const domain = document.getElementById("dmName").value.trim() || "kms-admin.example.com";
+  const email = document.getElementById("dmMail").value.trim();
+  const j = await api(`/api/domain/caddy?domain=${encodeURIComponent(domain)}&email=${encodeURIComponent(email)}`);
+  document.getElementById("caddyBox").textContent = j.caddyfile;
+  document.getElementById("dnsBody").innerHTML = j.dns_records.map(r =>
+    `<tr><td><span class="tag info">${esc(r.type)}</span></td><td class="mono">${esc(r.name)}</td>
+         <td class="mono">${esc(r.value)}</td><td class="hint">${esc(r.why)}</td></tr>`).join("");
+  document.getElementById("dmNotes").innerHTML = j.notes.map(n => "· " + esc(n)).join("<br>");
+  document.getElementById("dnsPanel").classList.remove("hidden");
+  document.getElementById("caddyPanel").classList.remove("hidden");
+  toast("配置与 DNS 记录已生成");
+}
+
+/* --- 激活统计 ---------------------------------------------------------- */
+function stDebounce(){ clearTimeout(stTimer); stTimer = setTimeout(() => loadStats(1), 350); }
+async function loadStats(page){
+  page = Math.max(1, page || 1);
+  const q = encodeURIComponent(document.getElementById("stQ").value.trim());
+  const result = document.getElementById("stResult").value;
+  const days = document.getElementById("stDays").value;
+  const j = await api(`/api/stats?page=${page}&per=50&q=${q}&result=${result}&days=${days}`);
+  stPage = page;
+
+  const sum = j.series.reduce((a, d) => a + d.ok, 0) + j.series.reduce((a, d) => a + d.fail, 0);
+  const fail = j.series.reduce((a, d) => a + d.fail, 0);
+  document.getElementById("stTotal").textContent = num(sum);
+  document.getElementById("stWindow").textContent = "窗口 " + days + " 天";
+  document.getElementById("stRate").textContent = sum ? ((sum - fail) / sum * 100).toFixed(1) + "%" : "–";
+  document.getElementById("stRate").className = "v " + (sum && fail / sum > 0.1 ? "warn-v" : "ok-v");
+  document.getElementById("stRateNote").textContent = "成功 " + num(sum - fail) + " 次";
+  document.getElementById("stFail").textContent = num(fail);
+  document.getElementById("stFail").className = "v " + (fail ? "bad-v" : "ok-v");
+  document.getElementById("stFailNote").textContent = sum ? "占比 " + (fail / sum * 100).toFixed(1) + "%" : "";
+  document.getElementById("stStore").textContent = bytes(j.summary.storage_bytes);
+  document.getElementById("stQuota").textContent = "配额 " + bytes(j.summary.quota_bytes);
+
+  document.getElementById("stBody").innerHTML = j.page.rows.map(r => `
+    <tr><td class="mono">${esc(r.time)}</td><td class="mono">${esc(r.ip)}</td>
+        <td>${esc(r.product)}</td><td class="mono" style="color:var(--dim)">${esc(r.version || "–")}</td>
+        <td>${r.ok
+              ? '<span class="tag ok"><svg class="ico"><use href="#i-check"/></svg>成功</span>'
+              : `<span class="tag bad" title="${esc(r.reason)}"><svg class="ico"><use href="#i-x-circle"/></svg>拒绝</span>`}</td>
+        <td class="num mono">${r.elapsed}s</td></tr>`).join("") ||
+    '<tr><td colspan="6" class="empty">没有匹配的记录</td></tr>';
+  const pages = Math.max(1, Math.ceil(j.page.total / j.page.per));
+  document.getElementById("stPageInfo").textContent =
+    "第 " + page + " / " + pages + " 页 · 共 " + num(j.page.total) + " 条";
+  document.getElementById("stMeta").textContent = "";
+
+  const maxP = Math.max(1, ...j.top_products.map(x => x.n));
+  document.getElementById("stProducts").innerHTML = j.top_products.map(x =>
+    `<div class="r"><b title="${esc(x.key)}">${esc(x.key)}</b><span class="n">${num(x.n)}</span>
+      <span class="bar"><i style="width:${Math.round(x.n / maxP * 100)}%"></i></span></div>`).join("") ||
+    '<div class="empty">暂无数据</div>';
+  const maxF = Math.max(1, ...j.top_fails.map(x => x.n));
+  document.getElementById("stFails").innerHTML = j.top_fails.map(x =>
+    `<div class="r"><b title="${esc(x.key)}">${esc(x.key)}</b><span class="n">${num(x.n)}</span>
+      <span class="bar warn"><i style="width:${Math.round(x.n / maxF * 100)}%"></i></span></div>`).join("") ||
+    '<div class="empty">没有失败记录</div>';
+}
+async function prune(){
+  const j = await api("/api/stats/prune", {method:"POST"});
+  toast("已按配额清理 " + num(j.removed) + " 条旧记录");
+  loadStats(stPage); loadSummary();
+}
+
+/* --- 标签页 ----------------------------------------------------------- */
+document.querySelectorAll("nav button").forEach(b => b.onclick = () => {
+  document.querySelectorAll("nav button").forEach(x => x.classList.toggle("active", x === b));
+  for(const id of ["overview","config","service","domain","stats"])
+    document.getElementById("tab-" + id).classList.toggle("hidden", id !== b.dataset.tab);
+  if(b.dataset.tab === "stats") loadStats(stPage);
+});
+
+/* --- 入口 ------------------------------------------------------------- */
+applyTheme(localStorage.getItem(THEME_KEY) || "light");
+if(TOKEN) boot(); else showLogin();
+</script>
+</body>
+</html>

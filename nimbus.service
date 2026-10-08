@@ -1,0 +1,98 @@
+# =============================================================================
+#  Nimbus - systemd unit TEMPLATE
+#
+#  install.sh substitutes the @PLACEHOLDER@ tokens below and writes the result
+#  to /etc/systemd/system/nimbus.service:
+#
+#    @BIND@   panel bind address       (install.sh --bind, default 127.0.0.1)
+#    @PORT@   panel TCP port           (install.sh --port, default 8099)
+#    @UNIT@   managed systemd unit     (install.sh --unit, default vlmcsd)
+#    @INI@    managed vlmcsd ini path  (install.sh --ini,  default /etc/vlmcsd.ini)
+#
+#  Do not copy this file to /etc/systemd/system by hand: the placeholders would
+#  end up in the ExecStart line. Use "sudo bash install.sh" (idempotent) - it
+#  also creates the token, the data directory and the panel files.
+#
+#  ---------------------------------------------------------------------------
+#  !! NOT VERIFIED ON A REAL LINUX HOST !!
+#
+#  This unit was written on a development box and is syntax reviewed only. It
+#  has never been started against a live vlmcsd server. The hardening block is
+#  deliberately aggressive and has two known risk points:
+#
+#   1) CapabilityBoundingSet= (empty) + User=root. systemd still lets root talk
+#      to PID 1 over D-Bus (that is a UID check, not a capability check), so
+#      "systemctl restart @UNIT@" should keep working - but this is exactly the
+#      kind of thing that needs a real machine to confirm.
+#   2) ProtectSystem=strict makes the whole filesystem read-only except
+#      /dev, /proc, /sys, StateDirectory= and ReadWritePaths=. The ini and its
+#      .bak/.tmp siblings are whitelisted below; if you point --ini somewhere
+#      else, install.sh rewrites ReadWritePaths accordingly.
+#
+#  MORE CONSERVATIVE ALTERNATIVES, in the order I would try them:
+#
+#   (a) Comment out "ProtectSystem=strict" and "CapabilityBoundingSet=" and
+#       keep everything else. Nothing else in the block prevents writing files.
+#   (b) Run Nimbus as an unprivileged user and hand it a sudoers whitelist:
+#         nimbus ALL=(root) NOPASSWD: /bin/systemctl start @UNIT@, \
+#             /bin/systemctl stop @UNIT@, /bin/systemctl restart @UNIT@, \
+#             /bin/systemctl is-active @UNIT@, /bin/systemctl show @UNIT@, \
+#             /bin/systemctl kill -s HUP @UNIT@, /usr/bin/journalctl -u @UNIT@ *
+#       Caveat, stated honestly: nimbus.py currently calls systemctl and
+#       journalctl directly, so this route needs a sudo prefix (or a small
+#       wrapper script) that does not exist yet. It is untested as well.
+#   (c) Read-only deployment: run "nimbus.py --mode real" against a copy of the
+#       ini (--ini /var/lib/nimbus/vlmcsd.ini) and drop the service-control
+#       feature, or simply run the demo mode next to the real KMS server.
+# =============================================================================
+
+[Unit]
+Description=Nimbus - web admin panel for the vlmcsd KMS service
+Documentation=https://github.com/Yumina0789/Nimbus
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Real mode edits the vlmcsd ini and drives systemctl, hence root.
+User=root
+ExecStart=/usr/bin/python3 /usr/local/lib/nimbus/nimbus.py --mode real --bind @BIND@ --port @PORT@ --data-dir /var/lib/nimbus --token-file /etc/nimbus.token --unit @UNIT@ --ini @INI@
+Restart=on-failure
+RestartSec=3
+
+# /var/lib/nimbus is created by systemd (0700) and stays writable even with
+# ProtectSystem=strict below.
+StateDirectory=nimbus
+StateDirectoryMode=0700
+
+# --- Hardening ---------------------------------------------------------------
+# Requires a reasonably recent systemd: ProtectProc= needs >= 247,
+# ProtectClock/ProtectHostname >= 245, ProtectKernelLogs >= 244,
+# ProtectKernelTunables/Modules and RestrictNamespaces >= 232.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+# No capabilities at all: root keeps D-Bus access to systemd by UID.
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# Only these three paths may be written while ProtectSystem=strict is active.
+# install.sh rewrites this line when --ini points somewhere else.
+ReadWritePaths=@INI@ @INI@.bak @INI@.tmp
+
+[Install]
+WantedBy=multi-user.target
