@@ -811,11 +811,17 @@ class ContainerBackend(LinuxBackend):
     PRODUCT_RE = re.compile(r"Application ID\s*:\s*\S+\s*\((?P<product>[^)]+)\)")
     SENT_RE = re.compile(r">>>\s*Sending response")
     REJECT_RE = re.compile(r"(reject|not licensed|error|fail)", re.I)
+    # 只有 "accepted" + "closed"、中间没有任何请求体的连接，是端口探活（监控健康检查、
+    # 扫描器）。它不该被记成一次"失败的激活"，否则面板上的失败数全是噪声。
+    PAYLOAD_RE = re.compile(r"<<<|Application ID|Client machine ID|Sending response|"
+                            r"reject|not licensed|error|fail", re.I)
 
     def _event_from_block(self, block):
         """把一个连接块变成一条统计记录；不是一个完整块就返回 None。"""
         m = self.ACCEPT_RE.search(block)
         if not m:
+            return None
+        if not self.PAYLOAD_RE.search(block):
             return None
         ip = m.group("ip")
         ok = bool(self.SENT_RE.search(block))
