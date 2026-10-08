@@ -50,7 +50,14 @@ jobs:
           echo "--- GET / ---"
           curl -fsS "http://127.0.0.1:8099/" -o "$RUNNER_TEMP/index.html"
           grep -q '<title>Nimbus 管理面板</title>' "$RUNNER_TEMP/index.html"
-          echo "GET / -> 200, title ok"
+          # 光看 <title> 不够：JSON 转义不动尖括号，所以整页被 json.dumps 之后 grep 照样命中
+          # （Steward 就栽在这上面：页面被当成 JSON 字符串发出去，浏览器当纯文本渲染 = 没有 CSS）。
+          head -c 20 "$RUNNER_TEMP/index.html" | grep -qi '<!doctype html>' \
+            || { echo "页面不是以 <!DOCTYPE html> 开头的 HTML："; head -c 120 "$RUNNER_TEMP/index.html"; exit 1; }
+          tail -c 20 "$RUNNER_TEMP/index.html" | grep -qi '</html>' \
+            || { echo "页面没有正常结尾（可能被截断）"; exit 1; }
+          grep -q '<style>' "$RUNNER_TEMP/index.html" || { echo "页面里没有 <style> 块"; exit 1; }
+          echo "GET / -> 200, 是完整 HTML（含样式）"
 
           echo "--- GET /api/meta ---"
           curl -fsS "http://127.0.0.1:8099/api/meta" -o "$RUNNER_TEMP/meta.json"
